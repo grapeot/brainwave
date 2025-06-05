@@ -634,7 +634,7 @@ async def transcribe_gemini_sse(request: Request, file: UploadFile = File(...)):
         # However, to keep SSE error reporting consistent:
         async def error_sse_generator():
             error_payload = json.dumps({'error': f'Failed to read uploaded file: {str(e)}'})
-            yield f"event: error\\ndata: {error_payload}\\n\\n"
+            yield f"event: error\ndata: {error_payload}\n\n"
         return StreamingResponse(error_sse_generator(), media_type="text/event-stream")
 
     # This inner generator now takes the bytes and filename, not the UploadFile object.
@@ -646,24 +646,23 @@ async def transcribe_gemini_sse(request: Request, file: UploadFile = File(...)):
             if not prompt:
                 error_detail = "Gemini transcription prompt not found in prompts.py."
                 logger.error(error_detail)
-                yield f"event: error\\ndata: {json.dumps({'error': error_detail}, ensure_ascii=False)}\\n\\n"
+                yield f"event: error\ndata: {json.dumps({'error': error_detail}, ensure_ascii=False)}\n\n"
                 return
 
             async for chunk in generate_transcription_stream(audio_data, prompt):
-                # Use json.dumps with ensure_ascii=False
                 json_payload = json.dumps({"text_chunk": chunk}, ensure_ascii=False)
-                yield f"data: {json_payload}\\n\\n"
+                yield f"data: {json_payload}\n\n"
                 request_processed_successfully = True # Mark as successful if at least one chunk is sent
         except ValueError as ve:
             logger.error(f"ValueError during Gemini transcription for {filename_for_logging}: {ve}", exc_info=True)
-            yield f"event: error\\ndata: {json.dumps({'error': str(ve)}, ensure_ascii=False)}\\n\\n"
+            yield f"event: error\ndata: {json.dumps({'error': str(ve)}, ensure_ascii=False)}\n\n"
         except RuntimeError as re:
             logger.error(f"RuntimeError during Gemini transcription for {filename_for_logging}: {re}", exc_info=True)
-            yield f"event: error\\ndata: {json.dumps({'error': str(re)}, ensure_ascii=False)}\\n\\n"
+            yield f"event: error\ndata: {json.dumps({'error': str(re)}, ensure_ascii=False)}\n\n"
         except Exception as e:
             logger.error(f"Unexpected error during Gemini transcription stream for {filename_for_logging}: {e}", exc_info=True)
             # Send a generic error to the client
-            yield f"event: error\\ndata: {json.dumps({'error': 'An unexpected error occurred during transcription.'}, ensure_ascii=False)}\\n\\n"
+            yield f"event: error\ndata: {json.dumps({'error': 'An unexpected error occurred during transcription.'}, ensure_ascii=False)}\n\n"
         finally:
             logger.info(f"Closing SSE event generator for {filename_for_logging}. Success: {request_processed_successfully}")
 

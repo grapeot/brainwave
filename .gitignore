@@ -2,3 +2,6 @@
 .windsurfrules
 scratchpad.md
 .env
+__pycache__/
+test.m4a
+tmp_extracted_responses_with_time.json
