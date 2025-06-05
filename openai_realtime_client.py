@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 class OpenAIRealtimeAudioTextClient:
-    def __init__(self, api_key: str, model: str = "gpt-4o-realtime-preview"):
+    def __init__(self, api_key: str, model: str = "gpt-4o-realtime-preview-2025-06-03"):
         self.api_key = api_key
         self.model = model
         self.ws = None
@@ -22,7 +22,7 @@ class OpenAIRealtimeAudioTextClient:
         self.handlers: Dict[str, Callable[[dict], asyncio.Future]] = {}
         self.queue = asyncio.Queue()
         
-    async def connect(self, modalities: List[str] = ["text"]):
+    async def connect(self, modalities: List[str] = ["text"], session_mode: str = "conversation"):
         """Connect to OpenAI's realtime API and configure the session"""
         self.ws = await websockets.connect(
             f"{self.base_url}?model={self.model}",
@@ -39,15 +39,24 @@ class OpenAIRealtimeAudioTextClient:
             self.session_id = response_data["session"]["id"]
             logger.info(f"Session created with ID: {self.session_id}")
             
+            session_config_payload = {
+                "modalities": modalities,
+                "input_audio_format": "pcm16",
+            }
+
+            if session_mode == "transcription":
+                session_config_payload["input_audio_transcription"] = {"enabled": True}
+                session_config_payload["turn_detection"] = {"enabled": False}
+                logger.info("Configuring session for transcription mode.")
+            else:  # Default to conversation mode
+                session_config_payload["input_audio_transcription"] = None
+                session_config_payload["turn_detection"] = None
+                logger.info("Configuring session for conversation mode.")
+
             # Configure session
             await self.ws.send(json.dumps({
                 "type": "session.update",
-                "session": {
-                    "modalities": modalities,
-                    "input_audio_format": "pcm16",
-                    "input_audio_transcription": None,
-                    "turn_detection": None,
-                }
+                "session": session_config_payload
             }))
         
         # Register the default handler
@@ -84,7 +93,6 @@ class OpenAIRealtimeAudioTextClient:
                 "type": "input_audio_buffer.append",
                 "audio": base64.b64encode(audio_data).decode('utf-8')
             }))
-            logger.info("Sent input_audio_buffer.append message to OpenAI")
         else:
             logger.error("WebSocket is not open. Cannot send audio.")
     
