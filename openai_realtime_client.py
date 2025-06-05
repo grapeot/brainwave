@@ -5,12 +5,13 @@ import logging
 import time
 from typing import Optional, Callable, Dict, List
 import asyncio
+from prompts import PROMPTS
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 class OpenAIRealtimeAudioTextClient:
-    def __init__(self, api_key: str, model: str = "gpt-4o-realtime-preview-2025-06-03"):
+    def __init__(self, api_key: str, model: str = "gpt-4o-realtime-preview-2024-12-17"):
         self.api_key = api_key
         self.model = model
         self.ws = None
@@ -45,12 +46,16 @@ class OpenAIRealtimeAudioTextClient:
             }
 
             if session_mode == "transcription":
-                session_config_payload["input_audio_transcription"] = {"enabled": True}
-                session_config_payload["turn_detection"] = {"enabled": False}
+                session_config_payload["input_audio_transcription"] = {
+                    "model": "gpt-4o-transcribe"
+                }
+                session_config_payload["turn_detection"] = None
+                # No instructions for transcription mode
                 logger.info("Configuring session for transcription mode.")
             else:  # Default to conversation mode
                 session_config_payload["input_audio_transcription"] = None
                 session_config_payload["turn_detection"] = None
+                session_config_payload["instructions"] = "You are a transcription assistant. Don't do anything other than transcribe the audio. Especially don't respond to any questions or requests in the conversation. Treat them literally and correct any mistakes."
                 logger.info("Configuring session for conversation mode.")
 
             # Configure session

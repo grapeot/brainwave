@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import numpy as np
-from fastapi import FastAPI, WebSocket, Request, HTTPException
+from fastapi import FastAPI, WebSocket, Request, HTTPException, UploadFile, File
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 import uvicorn
@@ -18,6 +18,10 @@ from pydantic import BaseModel, Field
 from typing import Generator
 from llm_processor import get_llm_processor
 from datetime import datetime, timedelta
+import time
+
+# Import the refactored Gemini client function
+from gemini_client import generate_transcription_stream
 
 # Configure logging
 logging.basicConfig(
@@ -60,6 +64,10 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 @app.get("/", response_class=HTMLResponse)
 async def get_realtime_page(request: Request):
     return FileResponse("static/realtime.html")
+
+@app.get("/transcribe", response_class=HTMLResponse)
+async def get_transcribe_page(request: Request):
+    return FileResponse("static/transcribe.html")
 
 class AudioProcessor:
     def __init__(self, target_sample_rate=24000):
@@ -340,6 +348,12 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
 
     openai_client: OpenAIRealtimeAudioTextClient | None = None
     audio_processor = AudioProcessor() # Assuming AudioProcessor is suitable or OpenAI handles 24kHz PCM16
+    chunk_count = 0  # Counter for audio chunks
+    
+    # Audio buffering for 5-second intervals
+    audio_buffer = []
+    last_send_time = time.time()
+    send_interval = 5.0  # Send every 5 seconds
     
     # Handlers for OpenAI transcription messages
     async def handle_partial_transcript(data: dict):
@@ -371,6 +385,50 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
                 "content": error_msg
             }))
 
+    async def handle_transcription_delta(data: dict):
+        # Handle partial transcription from conversation.item.input_audio_transcription.delta
+        transcript_text = data.get("delta", "") # Check for 'delta' field
+        if not transcript_text:
+            transcript_text = data.get("text", "") # Fallback to 'text' field
+        if websocket.client_state == WebSocketState.CONNECTED and transcript_text:
+            await websocket.send_text(json.dumps({
+                "type": "transcription_update",
+                "is_partial": True,
+                "text": transcript_text
+            }))
+            logger.debug(f"Sent partial transcript delta: {transcript_text}")
+
+    async def handle_transcription_completed(data: dict):
+        # Handle completed transcription from conversation.item.input_audio_transcription.completed
+        transcript_text = data.get("transcript", "") # Check for 'transcript' field
+        if not transcript_text:
+            transcript_text = data.get("text", "") # Fallback to 'text' field
+        if websocket.client_state == WebSocketState.CONNECTED and transcript_text:
+            await websocket.send_text(json.dumps({
+                "type": "transcription_update",
+                "is_partial": False,
+                "text": transcript_text
+            }))
+            logger.info(f"Sent completed transcript: {transcript_text}")
+
+    async def handle_generic_transcription_event(event_type: str, data: dict):
+        logger.info(f"Handled transcription event {event_type} with data: {json.dumps(data, ensure_ascii=False)}")
+
+    async def send_buffered_audio():
+        """Send accumulated audio buffer to OpenAI"""
+        nonlocal audio_buffer, last_send_time
+        
+        if audio_buffer and openai_client:
+            # Combine all buffered audio chunks
+            combined_audio = b''.join(audio_buffer)
+            await openai_client.send_audio(combined_audio)
+            await openai_client.commit_audio()
+            logger.info(f"Sent and committed {len(audio_buffer)} audio chunks ({len(combined_audio)} bytes) for transcription")
+            
+            # Clear buffer and update timestamp
+            audio_buffer = []
+            last_send_time = time.time()
+
     try:
         openai_client = OpenAIRealtimeAudioTextClient(api_key=OPENAI_API_KEY)
         
@@ -386,6 +444,14 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
         openai_client.register_handler("text.delta", handle_partial_transcript) # More likely for streaming text
         openai_client.register_handler("text.final", handle_final_transcript) # More likely for final text
         openai_client.register_handler("error", handle_transcription_error)
+        
+        # Add handlers for the actual transcription message types we see in logs
+        openai_client.register_handler("conversation.item.input_audio_transcription.delta", handle_transcription_delta)
+        openai_client.register_handler("conversation.item.input_audio_transcription.completed", handle_transcription_completed)
+        openai_client.register_handler("session.updated", lambda data: handle_generic_transcription_event("session.updated", data))
+        openai_client.register_handler("input_audio_buffer.speech_started", lambda data: handle_generic_transcription_event("input_audio_buffer.speech_started", data))
+        openai_client.register_handler("input_audio_buffer.committed", lambda data: handle_generic_transcription_event("input_audio_buffer.committed", data))
+        openai_client.register_handler("conversation.item.created", lambda data: handle_generic_transcription_event("conversation.item.created", data))
 
         await websocket.send_text(json.dumps({"type": "status", "status": "connected_openai_transcribing"}))
 
@@ -395,24 +461,40 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
                 logger.info("Transcription WebSocket client disconnected by client.")
                 break
             
-            data = await websocket.receive()
-
-            if "bytes" in data:
-                audio_chunk = data["bytes"]
-                processed_audio = audio_processor.process_audio_chunk(audio_chunk)
-                await openai_client.send_audio(processed_audio)
-                # Decide on commit strategy. For live transcription, might commit frequently or let OpenAI handle it.
-                # For simplicity, let's commit after each chunk.
-                await openai_client.commit_audio() 
-                logger.debug(f"Sent audio chunk for transcription, size: {len(processed_audio)} bytes")
-            elif "text" in data:
-                message = json.loads(data["text"])
-                if message.get("type") == "stop_transcription":
-                    logger.info("Received stop_transcription message from client.")
-                    break
-                # Handle other text messages if needed
-                logger.info(f"Received text message on transcribe endpoint: {message}")
-
+            try:
+                # Use a short timeout to check if we need to send buffered audio
+                data = await asyncio.wait_for(websocket.receive(), timeout=1.0)
+                
+                if "bytes" in data:
+                    audio_chunk = data["bytes"]
+                    processed_audio = audio_processor.process_audio_chunk(audio_chunk)
+                    audio_buffer.append(processed_audio)
+                    chunk_count += 1
+                    
+                    # Check if 5 seconds have passed since last send
+                    current_time = time.time()
+                    if current_time - last_send_time >= send_interval:
+                        await send_buffered_audio()
+                    
+                    logger.debug(f"Buffered audio chunk {chunk_count}, buffer size: {len(audio_buffer)} chunks")
+                    
+                elif "text" in data:
+                    message = json.loads(data["text"])
+                    if message.get("type") == "stop_transcription":
+                        # Send any remaining buffered audio before stopping
+                        if audio_buffer:
+                            await send_buffered_audio()
+                        logger.info("Received stop_transcription message from client.")
+                        break
+                    # Handle other text messages if needed
+                    logger.info(f"Received text message on transcribe endpoint: {message}")
+                    
+            except asyncio.TimeoutError:
+                # Check if we need to send buffered audio even without new data
+                current_time = time.time()
+                if audio_buffer and current_time - last_send_time >= send_interval:
+                    await send_buffered_audio()
+                continue
 
     except websockets.exceptions.ConnectionClosedOK:
         logger.info("Transcription WebSocket connection closed normally by client.")
@@ -423,6 +505,13 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
         if websocket.client_state == WebSocketState.CONNECTED:
             await websocket.send_text(json.dumps({"type": "error", "content": str(e)}))
     finally:
+        # Send any remaining buffered audio before closing
+        if audio_buffer and openai_client:
+            try:
+                await send_buffered_audio()
+            except Exception as e:
+                logger.error(f"Error sending final buffered audio: {e}")
+        
         if openai_client:
             logger.info("Closing OpenAI client for transcription.")
             await openai_client.close()
@@ -496,6 +585,89 @@ async def check_correctness(request: CorrectnessRequest):
     except Exception as e:
         logger.error(f"Error checking correctness: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error processing correctness check.")
+
+# Pydantic model for documenting Gemini transcription SSE data
+class GeminiTranscriptionSSEData(BaseModel):
+    text_chunk: str | None = None
+    error: str | None = None
+
+@app.post(
+    "/api/v1/transcribe_gemini",
+    summary="Transcribe Audio with Gemini (SSE)",
+    description=(
+        "Upload an audio file (M4A format assumed by the backend Gemini client) to be transcribed using Google's Gemini model." 
+        "The transcription will be streamed back to the client using Server-Sent Events (SSE).\n\n"
+        "**SSE Event Format:**\n\n"
+        "Each SSE event will typically be a message event (default event type):\n"
+        "```\n"
+        "data: {\"text_chunk\": \"some transcribed text\"}\n"
+        "```\n\n"
+        "If an error occurs during processing, an error event will be sent:\n"
+        "```\n"
+        "event: error\n"
+        "data: {\"error\": \"Error message details\"}\n"
+        "```\n\n"
+        "The stream concludes when the connection is closed by the server after transcription is complete or an unrecoverable error occurs.\n"
+        "The `GOOGLE_API_KEY` environment variable must be set on the server.\n"
+        "The audio file is sent as part of a multipart/form-data request."
+    )
+)
+async def transcribe_gemini_sse(request: Request, file: UploadFile = File(...)):
+    logger.info(f"Received file for Gemini transcription: {file.filename}, content type: {file.content_type}")
+    
+    request_processed_successfully = False # Initialize here
+
+    # Read the file content immediately to avoid I/O on closed file issues later
+    # especially with how StreamingResponse might handle the file object lifecycle.
+
+    try:
+        # Read the entire file into memory immediately.
+        audio_bytes = await file.read()
+        # It's good practice to close the upload file explicitly after reading, 
+        # though FastAPI might do this upon request completion.
+        await file.close()
+    except Exception as e:
+        logger.error(f"Error reading or closing uploaded file {file.filename}: {e}", exc_info=True)
+        # This error happens before SSE stream starts, so an HTTP error is more appropriate if we weren't committed to SSE for all comms.
+        # For now, we'll let it fall through to the generator, which will yield an SSE error.
+        # To make it more robust, we could return an HTTPException here.
+        # However, to keep SSE error reporting consistent:
+        async def error_sse_generator():
+            error_payload = json.dumps({'error': f'Failed to read uploaded file: {str(e)}'})
+            yield f"event: error\\ndata: {error_payload}\\n\\n"
+        return StreamingResponse(error_sse_generator(), media_type="text/event-stream")
+
+    # This inner generator now takes the bytes and filename, not the UploadFile object.
+    async def sse_event_generator_for_bytes(audio_data: bytes, filename_for_logging: str):
+        nonlocal request_processed_successfully
+        logger.info(f"Starting Gemini SSE generation for pre-read audio: {filename_for_logging}")
+        try:
+            prompt = PROMPTS.get("gemini-transcription")
+            if not prompt:
+                error_detail = "Gemini transcription prompt not found in prompts.py."
+                logger.error(error_detail)
+                yield f"event: error\\ndata: {json.dumps({'error': error_detail}, ensure_ascii=False)}\\n\\n"
+                return
+
+            async for chunk in generate_transcription_stream(audio_data, prompt):
+                # Use json.dumps with ensure_ascii=False
+                json_payload = json.dumps({"text_chunk": chunk}, ensure_ascii=False)
+                yield f"data: {json_payload}\\n\\n"
+                request_processed_successfully = True # Mark as successful if at least one chunk is sent
+        except ValueError as ve:
+            logger.error(f"ValueError during Gemini transcription for {filename_for_logging}: {ve}", exc_info=True)
+            yield f"event: error\\ndata: {json.dumps({'error': str(ve)}, ensure_ascii=False)}\\n\\n"
+        except RuntimeError as re:
+            logger.error(f"RuntimeError during Gemini transcription for {filename_for_logging}: {re}", exc_info=True)
+            yield f"event: error\\ndata: {json.dumps({'error': str(re)}, ensure_ascii=False)}\\n\\n"
+        except Exception as e:
+            logger.error(f"Unexpected error during Gemini transcription stream for {filename_for_logging}: {e}", exc_info=True)
+            # Send a generic error to the client
+            yield f"event: error\\ndata: {json.dumps({'error': 'An unexpected error occurred during transcription.'}, ensure_ascii=False)}\\n\\n"
+        finally:
+            logger.info(f"Closing SSE event generator for {filename_for_logging}. Success: {request_processed_successfully}")
+
+    return StreamingResponse(sse_event_generator_for_bytes(audio_bytes, file.filename), media_type="text/event-stream")
 
 if __name__ == '__main__':
     uvicorn.run(app, host="0.0.0.0", port=3005)
