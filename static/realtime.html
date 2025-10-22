@@ -6,25 +6,43 @@
     <link rel="stylesheet" type="text/css" href="static/style.css">
 </head>
 <body>
-    <div class="container">
-        <div id="connectionStatus" class="connection-status"></div>
-        <button id="themeToggle" class="theme-toggle">🌙</button>
-        <h1>Brainwave</h1>
-        <div id="timer" style="text-align: center; margin-bottom: 15px; font-size: 1.2rem;">00:00</div>
-        <button id="recordButton">Start</button>
-        <div class="transcript-container">
-            <textarea id="transcript"></textarea>
-            <button id="copyButton" class="copy-button">Copy</button>
-        </div>
-        <div class="button-container">
-            <button id="readabilityButton" class="action-button">Readability</button>
-            <button id="correctnessButton" class="action-button">Correctness</button>
-            <button id="askAIButton" class="action-button">Ask AI</button>
-        </div>
-        <div class="enhanced-transcript-container">
-            <textarea id="enhancedTranscript"></textarea>
-            <button id="copyEnhancedButton" class="copy-button">Copy</button>
-        </div>
+    <div class="app-shell">
+        <header class="top-bar">
+            <div class="brand">
+                <div class="brand-icon">🎧</div>
+                <div class="brand-text">
+                    <span class="brand-name">Brainwave</span>
+                    <span class="brand-subtitle">Real-time notes companion</span>
+                </div>
+            </div>
+            <div class="top-actions">
+                <div id="connectionStatus" class="connection-status status-disconnected" aria-live="polite">未连接</div>
+                <select id="languageToggle" class="language-toggle" aria-label="Select language">
+                    <option value="zh">中文</option>
+                    <option value="en">English</option>
+                </select>
+                <button id="themeToggle" class="theme-toggle" aria-label="Toggle theme">🌙</button>
+            </div>
+        </header>
+
+        <main class="main-content">
+            <section class="record-card">
+                <div class="timer" id="timer">00:00</div>
+                <button id="recordButton" class="record-button">
+                    <span class="record-icon" aria-hidden="true"></span>
+                    <span class="record-label">Start</span>
+                </button>
+                <p class="hotkey-hint" id="hotkeyHelp">按住 Space 开始录音，松开停止；按 Shift 在开始和结束之间切换</p>
+            </section>
+
+            <section class="transcript-card">
+                <div class="transcript-header">
+                    <h2 class="transcript-title">Transcript</h2>
+                    <button id="copyButton" class="copy-button">Copy</button>
+                </div>
+                <textarea id="transcript" class="transcript-area" placeholder="Transcription will appear here..."></textarea>
+            </section>
+        </main>
     </div>
     <script src="static/main.js"></script>
 </body>
