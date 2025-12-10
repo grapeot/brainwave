@@ -316,6 +316,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         msg = json.loads(data["text"])
                         
                         if msg.get("type") == "start_recording":
+                            # Update audio processor with client sample rate if provided
+                            client_sample_rate = msg.get("sampleRate")
+                            if client_sample_rate:
+                                logger.info(f"Setting audio processor source sample rate to {client_sample_rate}")
+                                audio_processor.source_sample_rate = int(client_sample_rate)
+
                             # Update status to connecting while initializing OpenAI
                             await websocket.send_text(json.dumps({
                                 "type": "status",
