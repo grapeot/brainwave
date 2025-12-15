@@ -192,7 +192,10 @@ async function startRecording() {
         if (!audioContext) await initAudio(stream);
 
         isRecording = true;
-        await ws.send(JSON.stringify({ type: 'start_recording' }));
+        await ws.send(JSON.stringify({ 
+            type: 'start_recording', 
+            sampleRate: audioContext.sampleRate 
+        }));
         
         startTimer();
         recordButton.textContent = 'Stop';
