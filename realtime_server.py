@@ -115,19 +115,22 @@ async def websocket_endpoint(websocket: WebSocket):
     audio_send_lock = asyncio.Lock()
     all_audio_sent = asyncio.Event()
     all_audio_sent.set()  # Initially set since no audio is pending
-    marker_prefix = "下面是不改变语言的语音识别结果：\n\n"
+    marker_prefix = "This is the transcription in the original language:\n\n"
     max_prefix_deltas = 20
     response_buffer = []
     marker_seen = False
     delta_counter = 0
     
-    async def initialize_openai():
+    async def initialize_openai(model: str = None):
         nonlocal client
         try:
             # Clear the ready flag while initializing
             openai_ready.clear()
             
-            client = OpenAIRealtimeAudioTextClient(os.getenv("OPENAI_API_KEY"))
+            # Use provided model or fall back to default
+            from config import OPENAI_REALTIME_MODEL
+            selected_model = model if model else OPENAI_REALTIME_MODEL
+            client = OpenAIRealtimeAudioTextClient(os.getenv("OPENAI_API_KEY"), model=selected_model)
             await client.connect()
             logger.info("Successfully connected to OpenAI client")
             
@@ -327,7 +330,9 @@ async def websocket_endpoint(websocket: WebSocket):
                                 "type": "status",
                                 "status": "connecting"
                             }))
-                            if not await initialize_openai():
+                            # Extract model from message, if provided
+                            model = msg.get("model")
+                            if not await initialize_openai(model=model):
                                 continue
                             recording_stopped.clear()
                             pending_audio_chunks.clear()
