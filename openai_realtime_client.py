@@ -5,13 +5,15 @@ import logging
 import time
 from typing import Optional, Callable, Dict, List
 import asyncio
+import os
 from prompts import PROMPTS
+from config import OPENAI_REALTIME_MODEL
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 class OpenAIRealtimeAudioTextClient:
-    def __init__(self, api_key: str, model: str = "gpt-4o-realtime-preview-2024-12-17"):
+    def __init__(self, api_key: str, model: str = OPENAI_REALTIME_MODEL):
         self.api_key = api_key
         self.model = model
         self.ws = None
@@ -25,13 +27,23 @@ class OpenAIRealtimeAudioTextClient:
         
     async def connect(self, modalities: List[str] = ["text"], session_mode: str = "conversation"):
         """Connect to OpenAI's realtime API and configure the session"""
-        self.ws = await websockets.connect(
-            f"{self.base_url}?model={self.model}",
-            extra_headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "OpenAI-Beta": "realtime=v1"
-            }
-        )
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "OpenAI-Beta": "realtime=v1",
+        }
+
+        # Support both websockets param names across versions: extra_headers (older) and additional_headers (newer)
+        try:
+            self.ws = await websockets.connect(
+                f"{self.base_url}?model={self.model}",
+                extra_headers=headers,
+            )
+        except TypeError:
+            # Fallback for newer versions where the kwarg is 'additional_headers'
+            self.ws = await websockets.connect(
+                f"{self.base_url}?model={self.model}",
+                additional_headers=headers,
+            )
         
         # Wait for session creation
         response = await self.ws.recv()
@@ -53,22 +65,62 @@ class OpenAIRealtimeAudioTextClient:
                 # No instructions for transcription mode
                 logger.info("Configuring session for transcription mode.")
             else:  # Default to conversation mode
-                session_config_payload["input_audio_transcription"] = None
+                # Disable server-side VAD; rely on manual buffering/commits
+                session_config_payload["input_audio_transcription"] = {
+                    "model": "gpt-4o-transcribe"
+                }
                 session_config_payload["turn_detection"] = None
-                session_config_payload["instructions"] = "You are a transcription assistant. Don't do anything other than transcribe the audio. Especially don't respond to any questions or requests in the conversation. Treat them literally and correct any mistakes."
-                logger.info("Configuring session for conversation mode.")
+                session_config_payload["instructions"] = PROMPTS['paraphrase-gpt-realtime-enhanced']
+                logger.info("Configuring session for conversation mode with transcription and no turn detection.")
 
             # Configure session
             await self.ws.send(json.dumps({
                 "type": "session.update",
                 "session": session_config_payload
-            }))
+            }, ensure_ascii=False))
         
         # Register the default handler
         self.register_handler("default", self.default_handler)
         
         # Start the receiver coroutine
         self.receive_task = asyncio.create_task(self.receive_messages())
+
+    def _is_ws_open(self) -> bool:
+        """Compatibility check for websockets versions to determine if connection is open."""
+        if not self.ws:
+            return False
+        # Prefer 'closed' if available (newer versions)
+        if hasattr(self.ws, "closed"):
+            try:
+                return not bool(self.ws.closed)
+            except Exception:
+                pass
+        # Fallback to 'open' (older versions)
+        if hasattr(self.ws, "open"):
+            try:
+                return bool(self.ws.open)
+            except Exception:
+                pass
+        # If neither attribute is reliable, assume open if object exists
+        return True
+    
+    async def send_instructions_audio(self):
+        """Send the instructions.wav file as audio input to be appended to current buffer"""
+        instructions_path = "instructions.wav"
+        if not os.path.exists(instructions_path):
+            logger.warning(f"Instructions audio file not found: {instructions_path}")
+            return
+            
+        try:
+            with open(instructions_path, "rb") as f:
+                audio_data = f.read()
+            
+            # Send the instructions audio to the buffer (appends to existing user audio)
+            await self.send_audio(audio_data)
+            logger.info("Sent instructions audio to OpenAI buffer (appended to user audio)")
+            
+        except Exception as e:
+            logger.error(f"Error sending instructions audio: {e}")
     
     async def receive_messages(self):
         try:
@@ -93,7 +145,7 @@ class OpenAIRealtimeAudioTextClient:
         logger.warning(f"Unhandled message type received from OpenAI: {message_type}")
     
     async def send_audio(self, audio_data: bytes):
-        if self.ws and self.ws.open:
+        if self._is_ws_open():
             await self.ws.send(json.dumps({
                 "type": "input_audio_buffer.append",
                 "audio": base64.b64encode(audio_data).decode('utf-8')
@@ -103,7 +155,7 @@ class OpenAIRealtimeAudioTextClient:
     
     async def commit_audio(self):
         """Commit the audio buffer and notify OpenAI"""
-        if self.ws and self.ws.open:
+        if self._is_ws_open():
             commit_message = json.dumps({"type": "input_audio_buffer.commit"})
             await self.ws.send(commit_message)
             logger.info("Sent input_audio_buffer.commit message to OpenAI")
@@ -113,7 +165,7 @@ class OpenAIRealtimeAudioTextClient:
     
     async def clear_audio_buffer(self):
         """Clear the audio buffer"""
-        if self.ws and self.ws.open:
+        if self._is_ws_open():
             clear_message = json.dumps({"type": "input_audio_buffer.clear"})
             await self.ws.send(clear_message)
             logger.info("Sent input_audio_buffer.clear message to OpenAI")
@@ -122,7 +174,7 @@ class OpenAIRealtimeAudioTextClient:
     
     async def start_response(self, instructions: str):
         """Start a new response with given instructions"""
-        if self.ws and self.ws.open:
+        if self._is_ws_open():
             await self.ws.send(json.dumps({
                 "type": "response.create",
                 "response": {

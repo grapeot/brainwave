@@ -10,3 +10,4 @@ pytest
 pytest-asyncio
 pytest-mock
 httpx
+pydub
