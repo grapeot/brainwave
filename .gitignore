@@ -5,3 +5,11 @@ scratchpad.md
 __pycache__/
 test.m4a
 tmp_extracted_responses_with_time.json
+
+# Test audio files
+*.m4a
+*.wav
+
+# Temporary files
+*.tmp
+*.temp
