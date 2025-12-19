@@ -239,9 +239,11 @@ Brainwave includes a browser-based replay feature that allows users to replay th
 - Backend allows multiple new connections from the same browser in a short time; if not allowed, frontend should wait for existing connection to return to idle before replaying
 
 **UI/UX:**
-- Add a "Replay Last Recording" button near the record button, with states: available/disabled/replaying
-- Disable record button during replay, show progress (based on `deltaMs` and chunk count)
-- If local storage is unavailable or quota insufficient, show reason in button tooltip
+- A circular refresh icon button (🔄) is displayed next to the Start button
+- Button states: available/disabled/replaying
+- During replay, the refresh icon rotates with animation
+- Disable record button during replay
+- If local storage is unavailable or quota insufficient, the replay button is disabled with a tooltip explaining the reason
 
 ---
 
