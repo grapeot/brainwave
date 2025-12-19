@@ -571,31 +571,20 @@ async function replayLastRecording() {
         // Wait a bit for backend to initialize
         await new Promise(resolve => setTimeout(resolve, 200));
         
-        // Replay audio chunks with timing
-        let lastDeltaMs = 0;
-        for (const chunk of chunks) {
-            if (chunk.kind === 'start') {
-                // Already sent start_recording
-                continue;
-            } else if (chunk.kind === 'stop') {
-                // Wait for the delay before sending stop
-                const delay = Math.max(10, chunk.deltaMs - lastDeltaMs);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                await ws.send(JSON.stringify({ type: 'stop_recording' }));
-            } else if (chunk.kind === 'audio' && chunk.payload) {
-                // Calculate delay based on deltaMs
-                const delay = Math.max(10, chunk.deltaMs - lastDeltaMs);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                
-                if (ws.readyState === WebSocket.OPEN) {
-                    ws.send(chunk.payload);
-                } else {
-                    throw new Error('WebSocket closed during replay');
-                }
-                
-                lastDeltaMs = chunk.deltaMs;
+        // Replay audio chunks - send as fast as possible
+        const audioChunks = chunks.filter(c => c.kind === 'audio' && c.payload);
+        
+        // Send all audio chunks immediately
+        for (const chunk of audioChunks) {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(chunk.payload);
+            } else {
+                throw new Error('WebSocket closed during replay');
             }
         }
+        
+        // Send stop_recording after all audio chunks
+        await ws.send(JSON.stringify({ type: 'stop_recording' }));
         
     } catch (error) {
         console.error('Error replaying recording:', error);
