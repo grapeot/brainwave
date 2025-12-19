@@ -1,6 +1,7 @@
 // Global state
 let ws, audioContext, processor, source, stream;
 let isRecording = false;
+let isReplaying = false;
 let timerInterval;
 let startTime;
 let audioBuffer = new Int16Array(0);
@@ -8,8 +9,17 @@ let wsConnected = false;
 let streamInitialized = false;
 let isAutoStarted = false;
 
+// IndexedDB state
+let db = null;
+let currentSessionId = null;
+let sessionStartTime = null;
+let chunkSeq = 0;
+let storageAvailable = false;
+
 // DOM elements
 const recordButton = document.getElementById('recordButton');
+const replayButton = document.getElementById('replayButton');
+const storageStatus = document.getElementById('storageStatus');
 const transcript = document.getElementById('transcript');
 const enhancedTranscript = document.getElementById('enhancedTranscript');
 const copyButton = document.getElementById('copyButton');
@@ -65,10 +75,55 @@ function stopTimer() {
     clearInterval(timerInterval);
 }
 
+// IndexedDB initialization
+async function initIndexedDB() {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open('brainwave-replay', 1);
+        
+        request.onerror = () => {
+            console.warn('IndexedDB not available, replay disabled');
+            storageAvailable = false;
+            if (replayButton) {
+                replayButton.disabled = true;
+                replayButton.title = 'Local storage not available';
+            }
+            resolve(false);
+        };
+        
+        request.onsuccess = () => {
+            db = request.result;
+            storageAvailable = true;
+            if (replayButton) {
+                replayButton.disabled = false;
+            }
+            updateReplayButtonState();
+            resolve(true);
+        };
+        
+        request.onupgradeneeded = (event) => {
+            db = event.target.result;
+            
+            // Create sessions store
+            if (!db.objectStoreNames.contains('sessions')) {
+                const sessionsStore = db.createObjectStore('sessions', { keyPath: 'id', autoIncrement: true });
+                sessionsStore.createIndex('status', 'status', { unique: false });
+                sessionsStore.createIndex('createdAt', 'createdAt', { unique: false });
+            }
+            
+            // Create chunks store
+            if (!db.objectStoreNames.contains('chunks')) {
+                const chunksStore = db.createObjectStore('chunks', { keyPath: 'id', autoIncrement: true });
+                chunksStore.createIndex('sessionId', 'sessionId', { unique: false });
+                chunksStore.createIndex('seq', 'seq', { unique: false });
+            }
+        };
+    });
+}
+
 // Audio processing
 function createAudioProcessor() {
     processor = audioContext.createScriptProcessor(4096, 1, 1);
-    processor.onaudioprocess = (e) => {
+    processor.onaudioprocess = async (e) => {
         if (!isRecording) return;
         
         const inputData = e.inputBuffer.getChannelData(0);
@@ -89,6 +144,18 @@ function createAudioProcessor() {
             
             if (ws.readyState === WebSocket.OPEN) {
                 ws.send(sendBuffer.buffer);
+                
+                // Store chunk in IndexedDB
+                if (storageAvailable && currentSessionId && sessionStartTime) {
+                    const deltaMs = performance.now() - sessionStartTime;
+                    await appendChunk(currentSessionId, {
+                        seq: chunkSeq++,
+                        deltaMs: deltaMs,
+                        kind: 'audio',
+                        payload: sendBuffer.buffer,
+                        byteLength: sendBuffer.byteLength
+                    });
+                }
             }
         }
     };
@@ -148,6 +215,8 @@ function initializeWebSocket() {
                 }
                 if (data.status === 'idle') {
                     copyToClipboard(transcript.value, copyButton);
+                    // Update replay button state when status becomes idle
+                    updateReplayButtonState();
                 }
                 break;
             case 'text':
@@ -162,6 +231,7 @@ function initializeWebSocket() {
             case 'error':
                 alert(data.content);
                 updateConnectionStatus('idle');
+                updateReplayButtonState();
                 break;
         }
     };
@@ -173,9 +243,194 @@ function initializeWebSocket() {
     };
 }
 
+// IndexedDB helpers
+async function createSession() {
+    if (!db) return null;
+    
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction(['sessions'], 'readwrite');
+        const store = transaction.objectStore('sessions');
+        const session = {
+            createdAt: new Date(),
+            status: 'recording',
+            sampleRate: 24000,
+            channelCount: 1,
+            durationMs: 0
+        };
+        
+        const request = store.add(session);
+        request.onsuccess = () => {
+            currentSessionId = request.result;
+            sessionStartTime = performance.now();
+            chunkSeq = 0;
+            
+            // Store start event
+            appendChunk(currentSessionId, {
+                seq: 0,
+                deltaMs: 0,
+                kind: 'start',
+                payload: null,
+                byteLength: 0
+            });
+            
+            resolve(currentSessionId);
+        };
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function appendChunk(sessionId, chunk) {
+    if (!db || !sessionId) return;
+    
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction(['chunks'], 'readwrite');
+        const store = transaction.objectStore('chunks');
+        const chunkData = {
+            sessionId: sessionId,
+            seq: chunk.seq,
+            deltaMs: chunk.deltaMs,
+            kind: chunk.kind,
+            payload: chunk.payload,
+            byteLength: chunk.byteLength
+        };
+        
+        const request = store.add(chunkData);
+        request.onsuccess = () => resolve();
+        request.onerror = () => {
+            console.warn('Failed to store chunk:', request.error);
+            resolve(); // Don't fail recording if storage fails
+        };
+    });
+}
+
+async function completeSession(sessionId, durationMs) {
+    if (!db || !sessionId) return;
+    
+    return new Promise((resolve) => {
+        const transaction = db.transaction(['sessions', 'chunks'], 'readwrite');
+        const sessionsStore = transaction.objectStore('sessions');
+        const chunksStore = transaction.objectStore('chunks');
+        
+        // Update session status
+        const getRequest = sessionsStore.get(sessionId);
+        getRequest.onsuccess = () => {
+            const session = getRequest.result;
+            session.status = 'completed';
+            session.durationMs = durationMs;
+            sessionsStore.put(session);
+            
+            // Store stop event
+            chunksStore.add({
+                sessionId: sessionId,
+                seq: chunkSeq++,
+                deltaMs: durationMs,
+                kind: 'stop',
+                payload: null,
+                byteLength: 0
+            });
+            
+            // Enforce quota
+            enforceQuota({ maxSessions: 5, maxBytes: 100 * 1024 * 1024 });
+            
+            resolve();
+        };
+        getRequest.onerror = () => resolve();
+    });
+}
+
+async function enforceQuota({ maxSessions, maxBytes }) {
+    if (!db) return;
+    
+    const transaction = db.transaction(['sessions', 'chunks'], 'readwrite');
+    const sessionsStore = transaction.objectStore('sessions');
+    const chunksStore = transaction.objectStore('chunks');
+    const index = sessionsStore.index('createdAt');
+    
+    const sessions = [];
+    index.openCursor().onsuccess = (event) => {
+        const cursor = event.target.result;
+        if (cursor) {
+            sessions.push(cursor.value);
+            cursor.continue();
+        } else {
+            // Sort by creation time (oldest first)
+            sessions.sort((a, b) => a.createdAt - b.createdAt);
+            
+            // Delete oldest sessions if over limit
+            while (sessions.length > maxSessions) {
+                const session = sessions.shift();
+                deleteSession(session.id);
+            }
+        }
+    };
+}
+
+async function deleteSession(sessionId) {
+    if (!db) return;
+    
+    const transaction = db.transaction(['sessions', 'chunks'], 'readwrite');
+    const sessionsStore = transaction.objectStore('sessions');
+    const chunksStore = transaction.objectStore('chunks');
+    const index = chunksStore.index('sessionId');
+    
+    // Delete all chunks for this session
+    index.openKeyCursor(IDBKeyRange.only(sessionId)).onsuccess = (event) => {
+        const cursor = event.target.result;
+        if (cursor) {
+            chunksStore.delete(cursor.primaryKey);
+            cursor.continue();
+        }
+    };
+    
+    // Delete session
+    sessionsStore.delete(sessionId);
+}
+
+async function getLatestCompletedSession() {
+    if (!db) return null;
+    
+    return new Promise((resolve) => {
+        const transaction = db.transaction(['sessions'], 'readonly');
+        const store = transaction.objectStore('sessions');
+        const index = store.index('status');
+        const request = index.getAll('completed');
+        
+        request.onsuccess = () => {
+            const sessions = request.result;
+            if (sessions.length === 0) {
+                resolve(null);
+                return;
+            }
+            
+            // Sort by creation time (newest first)
+            sessions.sort((a, b) => b.createdAt - a.createdAt);
+            resolve(sessions[0]);
+        };
+        request.onerror = () => resolve(null);
+    });
+}
+
+async function getSessionChunks(sessionId) {
+    if (!db || !sessionId) return [];
+    
+    return new Promise((resolve) => {
+        const transaction = db.transaction(['chunks'], 'readonly');
+        const store = transaction.objectStore('chunks');
+        const index = store.index('sessionId');
+        const request = index.getAll(sessionId);
+        
+        request.onsuccess = () => {
+            const chunks = request.result;
+            chunks.sort((a, b) => a.seq - b.seq);
+            resolve(chunks);
+        };
+        request.onerror = () => resolve([]);
+    });
+}
+
 // Recording control
 async function startRecording() {
-    if (isRecording) return;
+    if (isRecording || isReplaying) return;
     
     try {
         transcript.value = '';
@@ -199,11 +454,18 @@ async function startRecording() {
         isRecording = true;
         const modelSelect = document.getElementById('modelSelect');
         const selectedModel = modelSelect ? modelSelect.value : 'gpt-realtime';
+        
+        // Create session in IndexedDB
+        if (storageAvailable) {
+            await createSession();
+        }
+        
         await ws.send(JSON.stringify({ type: 'start_recording', model: selectedModel }));
         
         startTimer();
         recordButton.textContent = 'Stop';
         recordButton.classList.add('recording');
+        if (replayButton) replayButton.disabled = true;
         
     } catch (error) {
         console.error('Error starting recording:', error);
@@ -215,23 +477,163 @@ async function stopRecording() {
     if (!isRecording) return;
     
     isRecording = false;
+    const durationMs = performance.now() - sessionStartTime;
+    
     // Stop local timer immediately on stop
     stopTimer();
     
     if (audioBuffer.length > 0 && ws.readyState === WebSocket.OPEN) {
-        ws.send(audioBuffer.buffer);
+        const sendBuffer = audioBuffer.slice();
+        ws.send(sendBuffer.buffer);
+        
+        // Store final chunk
+        if (storageAvailable && currentSessionId && sessionStartTime) {
+            const deltaMs = performance.now() - sessionStartTime;
+            await appendChunk(currentSessionId, {
+                seq: chunkSeq++,
+                deltaMs: deltaMs,
+                kind: 'audio',
+                payload: sendBuffer.buffer,
+                byteLength: sendBuffer.byteLength
+            });
+        }
+        
         audioBuffer = new Int16Array(0);
     }
     
     await new Promise(resolve => setTimeout(resolve, 500));
     await ws.send(JSON.stringify({ type: 'stop_recording' }));
     
+    // Complete session in IndexedDB
+    if (storageAvailable && currentSessionId) {
+        await completeSession(currentSessionId, durationMs);
+        currentSessionId = null;
+        sessionStartTime = null;
+        chunkSeq = 0;
+    }
+    
     recordButton.textContent = 'Start';
     recordButton.classList.remove('recording');
+    updateReplayButtonState();
+}
+
+// Replay functionality
+async function replayLastRecording() {
+    if (isRecording || isReplaying || !storageAvailable) return;
+    
+    const session = await getLatestCompletedSession();
+    if (!session) {
+        alert('No completed recording found to replay.');
+        return;
+    }
+    
+    if (isRecording) {
+        alert('Please stop recording before replaying.');
+        return;
+    }
+    
+    isReplaying = true;
+    recordButton.disabled = true;
+    if (replayButton) {
+        replayButton.disabled = true;
+        replayButton.title = 'Replaying...';
+        replayButton.style.animation = 'spin 1s linear infinite';
+    }
+    
+    try {
+        // Get chunks for this session
+        const chunks = await getSessionChunks(session.id);
+        if (chunks.length === 0) {
+            throw new Error('No chunks found for session');
+        }
+        
+        // Clear transcript
+        transcript.value = '';
+        enhancedTranscript.value = '';
+        
+        // Ensure WebSocket is connected
+        if (!wsConnected || ws.readyState !== WebSocket.OPEN) {
+            await new Promise((resolve) => {
+                const checkConnection = setInterval(() => {
+                    if (wsConnected && ws.readyState === WebSocket.OPEN) {
+                        clearInterval(checkConnection);
+                        resolve();
+                    }
+                }, 100);
+            });
+        }
+        
+        // Send start_recording message
+        const modelSelect = document.getElementById('modelSelect');
+        const selectedModel = modelSelect ? modelSelect.value : 'gpt-realtime';
+        await ws.send(JSON.stringify({ type: 'start_recording', model: selectedModel }));
+        
+        // Wait a bit for backend to initialize
+        await new Promise(resolve => setTimeout(resolve, 200));
+        
+        // Replay audio chunks - send as fast as possible
+        const audioChunks = chunks.filter(c => c.kind === 'audio' && c.payload);
+        
+        // Send all audio chunks immediately
+        for (const chunk of audioChunks) {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(chunk.payload);
+            } else {
+                throw new Error('WebSocket closed during replay');
+            }
+        }
+        
+        // Send stop_recording after all audio chunks
+        await ws.send(JSON.stringify({ type: 'stop_recording' }));
+        
+    } catch (error) {
+        console.error('Error replaying recording:', error);
+        alert('Error replaying recording: ' + error.message);
+    } finally {
+        isReplaying = false;
+        recordButton.disabled = false;
+        updateReplayButtonState();
+    }
+}
+
+function updateReplayButtonState() {
+    if (!replayButton) return;
+    
+    if (!storageAvailable) {
+        replayButton.disabled = true;
+        replayButton.title = 'Local storage not available';
+        return;
+    }
+    
+    if (isRecording || isReplaying) {
+        replayButton.disabled = true;
+        if (isReplaying) {
+            replayButton.title = 'Replaying...';
+            replayButton.style.animation = 'spin 1s linear infinite';
+        } else {
+            replayButton.title = 'Recording in progress';
+            replayButton.style.animation = '';
+        }
+        return;
+    }
+    
+    // Check if there's a completed session
+    getLatestCompletedSession().then(session => {
+        if (session) {
+            replayButton.disabled = false;
+            replayButton.title = 'Replay last recording';
+            replayButton.style.animation = '';
+        } else {
+            replayButton.disabled = true;
+            replayButton.title = 'No recording to replay';
+            replayButton.style.animation = '';
+        }
+    });
 }
 
 // Event listeners
 recordButton.onclick = () => isRecording ? stopRecording() : startRecording();
+if (replayButton) replayButton.onclick = replayLastRecording;
 copyButton.onclick = () => copyToClipboard(transcript.value, copyButton);
 copyEnhancedButton.onclick = () => copyToClipboard(enhancedTranscript.value, copyEnhancedButton);
 
@@ -247,10 +649,10 @@ document.addEventListener('keydown', (event) => {
 });
 
 // Initialize on page load
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+    await initIndexedDB();
     initializeWebSocket();
     initializeTheme();
-    if (autoStart) initializeAudioStream();
 });
 // Readability and AI handlers
 if (readabilityButton) readabilityButton.onclick = async () => {
