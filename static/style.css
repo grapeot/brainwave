@@ -44,11 +44,51 @@ h1 {
     border: none;
     cursor: pointer;
     margin: 20px auto;
-    display: block;
+    display: inline-block;
     color: white;
     font-size: 1rem;
     box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
     transition: all 0.3s ease;
+    vertical-align: middle;
+}
+
+.replay-icon-button {
+    width: 50px;
+    height: 50px;
+    border-radius: 50%;
+    background-color: #007AFF;
+    border: none;
+    cursor: pointer;
+    color: white;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    transition: all 0.3s ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-left: 20px;
+    vertical-align: middle;
+    padding: 0;
+}
+
+.replay-icon-button svg {
+    width: 20px;
+    height: 20px;
+}
+
+.replay-icon-button:hover:not(:disabled) {
+    transform: scale(1.1);
+    background-color: #005bb5;
+}
+
+.replay-icon-button:disabled {
+    background-color: #cccccc;
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+.replay-icon-button:disabled:hover {
+    transform: none;
+    background-color: #cccccc;
 }
 
 #recordButton:hover {
@@ -213,6 +253,18 @@ body.dark-theme #recordButton.recording {
     /* Orange */
 }
 
+body.dark-theme .replay-icon-button {
+    background-color: #34C759;
+}
+
+body.dark-theme .replay-icon-button:hover:not(:disabled) {
+    background-color: #248a3d;
+}
+
+body.dark-theme .replay-icon-button:disabled {
+    background-color: #666666;
+}
+
 body.dark-theme .copy-button {
     background: #34C759;
     /* Green */
@@ -229,6 +281,15 @@ body.dark-theme .copy-button {
 
     100% {
         opacity: 1;
+    }
+}
+
+@keyframes spin {
+    from {
+        transform: rotate(0deg);
+    }
+    to {
+        transform: rotate(360deg);
     }
 }
 
