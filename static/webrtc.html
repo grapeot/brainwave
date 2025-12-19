@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Brainwave</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" type="text/css" href="static/style.css">
+    <style>
+        .nav { text-align: center; margin: 10px 0; }
+    </style>
+    <script>
+        // Ensure page is served over HTTPS for getUserMedia/WebRTC in browsers
+        if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+            console.warn('WebRTC works best over HTTPS.');
+        }
+    </script>
+</head>
+<body>
+    <div class="container">
+        <div class="nav"><a href="/old">← Old version (WebSocket)</a></div>
+        <div id="connectionStatus" class="connection-status"></div>
+        <button id="themeToggle" class="theme-toggle">🌙</button>
+        <h1>Brainwave</h1>
+        <div style="text-align: center; margin-bottom: 15px;">
+            <label for="modelSelect" style="margin-right: 10px;">Model:</label>
+            <select id="modelSelect" style="padding: 5px 10px; font-size: 1rem; border-radius: 4px;">
+                <option value="gpt-realtime">GPT Realtime</option>
+                <option value="gpt-realtime-mini-2025-12-15">gpt-realtime-mini-2025-12-15</option>
+            </select>
+        </div>
+        <div id="timer" style="text-align: center; margin-bottom: 15px; font-size: 1.2rem;">00:00</div>
+        <button id="recordButton">Start</button>
+        <div class="transcript-container">
+            <textarea id="transcript"></textarea>
+            <button id="copyButton" class="copy-button">Copy</button>
+        </div>
+        <div class="button-container">
+            <button id="readabilityButton" class="action-button">Readability</button>
+            <button id="correctnessButton" class="action-button">Correctness</button>
+        </div>
+        <div class="enhanced-transcript-container">
+            <textarea id="enhancedTranscript"></textarea>
+            <button id="copyEnhancedButton" class="copy-button">Copy</button>
+        </div>
+    </div>
+    <script src="static/webrtc.js"></script>
+</body>
+</html>
+
+
