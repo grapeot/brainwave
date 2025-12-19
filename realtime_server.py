@@ -4,7 +4,7 @@ import os
 import numpy as np
 from fastapi import FastAPI, WebSocket, Request, HTTPException, UploadFile, File
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, RedirectResponse
 import uvicorn
 import logging
 from prompts import PROMPTS
@@ -15,13 +15,19 @@ import datetime
 import scipy.signal
 from openai import OpenAI, AsyncOpenAI
 from pydantic import BaseModel, Field
-from typing import Generator
+from typing import Generator, Optional
 from llm_processor import get_llm_processor
 from datetime import datetime, timedelta
 import time
+import websockets
+import httpx
+from config import (
+    OPENAI_REALTIME_MODEL,
+    OPENAI_REALTIME_MODALITIES,
+    OPENAI_REALTIME_SESSION_TTL_SEC,
+)
 
-# Import the refactored Gemini client function
-from gemini_client import generate_transcription_stream
+# Gemini transcription import is deferred to runtime inside the endpoint
 
 # Configure logging
 logging.basicConfig(
@@ -63,11 +69,93 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/", response_class=HTMLResponse)
 async def get_realtime_page(request: Request):
+    # Default to WebSocket version (old version)
     return FileResponse("static/realtime.html")
 
 @app.get("/transcribe", response_class=HTMLResponse)
 async def get_transcribe_page(request: Request):
     return FileResponse("static/transcribe.html")
+
+@app.get("/webrtc", response_class=HTMLResponse)
+async def get_webrtc_page(request: Request):
+    # Redirect to root (WebSocket version)
+    return RedirectResponse(url="/", status_code=302)
+
+@app.get("/old", response_class=HTMLResponse)
+async def get_old_ws_page(request: Request):
+    # Redirect to root (WebSocket version)
+    return RedirectResponse(url="/", status_code=302)
+
+
+class CreateRealtimeSessionResponse(BaseModel):
+    success: bool = Field(default=True)
+    data: dict = Field(default_factory=dict)
+
+class CreateRealtimeSessionRequest(BaseModel):
+    model: Optional[str] = Field(default=None, description="OpenAI Realtime model to use. Defaults to OPENAI_REALTIME_MODEL if not provided.")
+
+@app.post(
+    "/api/v1/realtime/session",
+    response_model=CreateRealtimeSessionResponse,
+    summary="Create ephemeral OpenAI Realtime WebRTC session",
+    description=(
+        "Mint a short-lived client key for the browser to establish a WebRTC session "
+        "directly with OpenAI Realtime. This endpoint never returns the server API key."
+    )
+)
+async def create_realtime_session(request: CreateRealtimeSessionRequest):
+    try:
+        # Use provided model or fall back to default
+        model = request.model if request.model else OPENAI_REALTIME_MODEL
+        default_instructions = PROMPTS.get('paraphrase-gpt-realtime-enhanced', '')
+        payload = {
+            "model": model,
+            "modalities": OPENAI_REALTIME_MODALITIES,
+            # Use our transcription-oriented system prompt at the session level
+            "instructions": default_instructions,
+            # Enable live transcription deltas; no auto response creation
+            "input_audio_transcription": {"model": "gpt-4o-transcribe"},
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 0,
+                "silence_duration_ms": 3000,
+                "create_response": True,
+                "interrupt_response": False
+            }
+        }
+
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://api.openai.com/v1/realtime/sessions",
+                headers=headers,
+                json=payload,
+            )
+            if resp.status_code >= 400:
+                logger.error(f"OpenAI realtime session error: {resp.status_code} {resp.text}")
+                raise HTTPException(status_code=502, detail="Failed to create realtime session")
+            data = resp.json()
+            # Attach default instructions (same as WS flow) for client convenience
+            data["default_instructions"] = default_instructions
+            return CreateRealtimeSessionResponse(success=True, data=data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating realtime session: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal error creating realtime session")
+
+@app.get(
+    "/api/v1/realtime/default_prompt",
+    summary="Get default WebRTC instructions",
+    description="Return the default system instructions used for WebRTC text-only sessions.",
+)
+async def get_default_realtime_prompt():
+    return {"instructions": PROMPTS.get('paraphrase-gpt-realtime-enhanced', '')}
 
 class AudioProcessor:
     def __init__(self, target_sample_rate=24000):
@@ -110,7 +198,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.send_text(json.dumps({
         "type": "status",
         "status": "idle"  # Set initial status to idle (blue)
-    }))
+    }, ensure_ascii=False))
     
     client = None
     audio_processor = AudioProcessor()
@@ -118,14 +206,43 @@ async def websocket_endpoint(websocket: WebSocket):
     recording_stopped = asyncio.Event()
     openai_ready = asyncio.Event()
     pending_audio_chunks = []
+    clear_on_next_response = False
+    is_recording = False
+    marker_prefix = "下面是不改变语言的语音识别结果：\n\n"
+    max_prefix_deltas = 20
+    response_buffer = []
+    marker_seen = False
+    delta_counter = 0
+
+    async def emit_text_delta(content: str):
+        if content and websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.send_text(json.dumps({
+                "type": "text",
+                "content": content,
+                "isNewResponse": False
+            }, ensure_ascii=False))
+
+    async def flush_buffer(with_warning: bool = False):
+        nonlocal response_buffer
+        if not response_buffer:
+            return
+        buffered_text = "".join(response_buffer)
+        response_buffer = []
+        if buffered_text.startswith(marker_prefix):
+            buffered_text = buffered_text[len(marker_prefix):]
+        if with_warning and not buffered_text:
+            logger.warning("Buffered text discarded after removing marker prefix.")
+        await emit_text_delta(buffered_text)
     
-    async def initialize_openai():
+    async def initialize_openai(model: str = None):
         nonlocal client
         try:
             # Clear the ready flag while initializing
             openai_ready.clear()
             
-            client = OpenAIRealtimeAudioTextClient(os.getenv("OPENAI_API_KEY"))
+            # Use provided model or fall back to default
+            selected_model = model if model else OPENAI_REALTIME_MODEL
+            client = OpenAIRealtimeAudioTextClient(os.getenv("OPENAI_API_KEY"), model=selected_model)
             await client.connect()
             logger.info("Successfully connected to OpenAI client")
             
@@ -149,7 +266,7 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_text(json.dumps({
                 "type": "status",
                 "status": "connected"
-            }))
+            }, ensure_ascii=False))
             return True
         except Exception as e:
             logger.error(f"Failed to connect to OpenAI: {e}")
@@ -157,27 +274,61 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_text(json.dumps({
                 "type": "error",
                 "content": "Failed to initialize OpenAI connection"
-            }))
+            }, ensure_ascii=False))
             return False
 
     # Move the handler definitions here (before initialize_openai)
     async def handle_text_delta(data):
+        nonlocal response_buffer, marker_seen, delta_counter
         try:
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.send_text(json.dumps({
-                    "type": "text",
-                    "content": data.get("delta", ""),
-                    "isNewResponse": False
-                }))
+            if websocket.client_state != WebSocketState.CONNECTED:
+                return
+
+            delta = data.get("delta", "")
+
+            if marker_seen:
+                if delta:
+                    await emit_text_delta(delta)
+                    logger.info("Handled response.text.delta (passthrough)")
+                return
+
+            if delta:
+                response_buffer.append(delta)
+                delta_counter += 1
+
+            joined = "".join(response_buffer)
+            marker_index = joined.find(marker_prefix)
+
+            if marker_index != -1:
+                marker_seen = True
+                remaining = joined[marker_index + len(marker_prefix):]
+                response_buffer = []
+                await emit_text_delta(remaining)
+                logger.info("Handled response.text.delta (marker detected)")
+                return
+
+            if delta_counter >= max_prefix_deltas:
+                marker_seen = True
+                await flush_buffer(with_warning=True)
+                logger.warning("Marker prefix not detected after max deltas; emitted buffered text.")
+            else:
+                logger.info("Handled response.text.delta (buffering)")
         except Exception as e:
             logger.error(f"Error in handle_text_delta: {str(e)}", exc_info=True)
 
     async def handle_response_created(data):
-        await websocket.send_text(json.dumps({
-            "type": "text",
-            "content": "",
-            "isNewResponse": True
-        }))
+        # Only clear UI on the first response after an explicit Start from the user
+        nonlocal clear_on_next_response, response_buffer, marker_seen, delta_counter
+        response_buffer = []
+        marker_seen = False
+        delta_counter = 0
+        if clear_on_next_response:
+            await websocket.send_text(json.dumps({
+                "type": "text",
+                "content": "",
+                "isNewResponse": True
+            }, ensure_ascii=False))
+            clear_on_next_response = False
         logger.info("Handled response.created")
 
     async def handle_error(data):
@@ -186,26 +337,31 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.send_text(json.dumps({
             "type": "error",
             "content": error_msg
-        }))
+        }, ensure_ascii=False))
+        # Ensure clients exit generating state even if OpenAI aborts the turn
+        await websocket.send_text(json.dumps({
+            "type": "status",
+            "status": "idle"
+        }, ensure_ascii=False))
         logger.info("Handled error message from OpenAI")
 
     async def handle_response_done(data):
-        nonlocal client
+        nonlocal client, response_buffer, marker_seen
         logger.info("Handled response.done")
+        if not marker_seen and response_buffer:
+            await flush_buffer()
+            marker_seen = True
+        # Do not close OpenAI session; keep it alive for next turn via server VAD
         recording_stopped.set()
         
-        if client:
-            try:
-                await client.close()
-                client = None
-                openai_ready.clear()
-                await websocket.send_text(json.dumps({
-                    "type": "status",
-                    "status": "idle"
-                }))
-                logger.info("Connection closed after response completion")
-            except Exception as e:
-                logger.error(f"Error closing client after response done: {str(e)}")
+        # Update frontend status depending on whether we're actively recording
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "status",
+                "status": "connected" if is_recording else "idle"
+            }, ensure_ascii=False))
+        except Exception as e:
+            logger.error(f"Error sending status after response done: {str(e)}", exc_info=True)
 
     async def handle_generic_event(event_type, data):
         logger.info(f"Handled {event_type} with data: {json.dumps(data, ensure_ascii=False)}")
@@ -232,12 +388,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         if not openai_ready.is_set():
                             logger.debug("OpenAI not ready, buffering audio chunk")
                             pending_audio_chunks.append(processed_audio)
-                        elif client:
+                        elif client and is_recording:
                             await client.send_audio(processed_audio)
                             await websocket.send_text(json.dumps({
                                 "type": "status",
                                 "status": "connected"
-                            }))
+                            }, ensure_ascii=False))
                             logger.debug(f"Sent audio chunk, size: {len(processed_audio)} bytes")
                         else:
                             logger.warning("Received audio but client is not initialized")
@@ -250,11 +406,21 @@ async def websocket_endpoint(websocket: WebSocket):
                             await websocket.send_text(json.dumps({
                                 "type": "status",
                                 "status": "connecting"
-                            }))
-                            if not await initialize_openai():
+                            }, ensure_ascii=False))
+                            # Extract model from message, if provided
+                            model = msg.get("model")
+                            if not await initialize_openai(model=model):
                                 continue
                             recording_stopped.clear()
                             pending_audio_chunks.clear()
+                            # Immediately clear transcript for a new client-initiated request
+                            await websocket.send_text(json.dumps({
+                                "type": "text",
+                                "content": "",
+                                "isNewResponse": True
+                            }, ensure_ascii=False))
+                            clear_on_next_response = False
+                            is_recording = True
                             
                             # Send any buffered chunks
                             if pending_audio_chunks and client:
@@ -264,16 +430,23 @@ async def websocket_endpoint(websocket: WebSocket):
                                 pending_audio_chunks.clear()
                             
                         elif msg.get("type") == "stop_recording":
+                            # On explicit Stop, force-commit and force-create a response, then wait for completion.
                             if client:
-                                await client.commit_audio()
-                                await client.start_response(PROMPTS['paraphrase-gpt-realtime'])
+                                # Immediately stop accepting further audio for this turn
+                                is_recording = False
+                                try:
+                                    await client.commit_audio()
+                                    await client.start_response(PROMPTS['paraphrase-gpt-realtime-enhanced'])
+                                except Exception as e:
+                                    logger.error(f"Error committing/starting response on stop: {str(e)}", exc_info=True)
+                                    # If we fail to kick off a response, surface that we're no longer recording
+                                    await websocket.send_text(json.dumps({
+                                        "type": "status",
+                                        "status": "idle"
+                                    }, ensure_ascii=False))
+                                    continue
+                                # Wait until the response is finished
                                 await recording_stopped.wait()
-                                # Don't close the client here, let the disconnect timer handle it
-                                # Update client status to connected (waiting for response)
-                                await websocket.send_text(json.dumps({
-                                    "type": "status",
-                                    "status": "connected"
-                                }))
 
                 except asyncio.TimeoutError:
                     logger.debug("No message received for 30 seconds")
@@ -545,24 +718,25 @@ async def enhance_readability(request: ReadabilityRequest):
         logger.error(f"Error enhancing readability: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error processing readability enhancement.")
 
-@app.post(
-    "/api/v1/ask_ai",
-    response_model=AskAIResponse,
-    summary="Ask AI a Question",
-    description="Ask AI to provide insights using O1-mini model."
-)
-def ask_ai(request: AskAIRequest):
-    prompt = PROMPTS.get('ask-ai')
-    if not prompt:
-        raise HTTPException(status_code=500, detail="Ask AI prompt not found.")
+# TEMPORARILY DISABLED - Ask AI API endpoint
+# @app.post(
+#     "/api/v1/ask_ai",
+#     response_model=AskAIResponse,
+#     summary="Ask AI a Question",
+#     description="Ask AI to provide insights using O1-mini model."
+# )
+# def ask_ai(request: AskAIRequest):
+#     prompt = PROMPTS.get('ask-ai')
+#     if not prompt:
+#         raise HTTPException(status_code=500, detail="Ask AI prompt not found.")
 
-    try:
-        # Use o3-mini specifically for ask_ai
-        answer = llm_processor.process_text_sync(request.text, prompt, model="gpt-4.1")
-        return AskAIResponse(answer=answer)
-    except Exception as e:
-        logger.error(f"Error processing AI question: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error processing AI question.")
+#     try:
+#         # Use o3-mini specifically for ask_ai
+#         answer = llm_processor.process_text_sync(request.text, prompt, model="gpt-4.1")
+#         return AskAIResponse(answer=answer)
+#     except Exception as e:
+#         logger.error(f"Error processing AI question: {e}", exc_info=True)
+#         raise HTTPException(status_code=500, detail="Error processing AI question.")
 
 @app.post(
     "/api/v1/correctness",
@@ -616,6 +790,15 @@ async def transcribe_gemini_sse(request: Request, file: UploadFile = File(...)):
     logger.info(f"Received file for Gemini transcription: {file.filename}, content type: {file.content_type}")
     
     request_processed_successfully = False # Initialize here
+
+    # Defer import of Gemini client so that the server can run without the Google SDK
+    try:
+        from gemini_client import generate_transcription_stream  # type: ignore
+    except Exception as e:
+        logger.warning(f"Gemini client unavailable: {e}")
+        async def error_sse_generator_unavailable():
+            yield f"event: error\ndata: {json.dumps({'error': 'Gemini transcription not available on this server. Install google-genai and set GOOGLE_API_KEY, or disable this endpoint.'}, ensure_ascii=False)}\n\n"
+        return StreamingResponse(error_sse_generator_unavailable(), media_type="text/event-stream")
 
     # Read the file content immediately to avoid I/O on closed file issues later
     # especially with how StreamingResponse might handle the file object lifecycle.
