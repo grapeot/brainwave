@@ -2,3 +2,12 @@
 .windsurfrules
 scratchpad.md
 .env
+__pycache__/
+
+# Test audio files
+*.m4a
+*.wav
+
+# Temporary files
+*.tmp
+*.temp

@@ -132,7 +132,8 @@ function initializeWebSocket() {
     
     ws.onopen = () => {
         wsConnected = true;
-        updateConnectionStatus(true);
+        // Set initial UI state to idle (blue) when socket opens
+        updateConnectionStatus('idle');
         if (autoStart && !isRecording && !isAutoStarted) startRecording();
     };
     
@@ -141,6 +142,10 @@ function initializeWebSocket() {
         switch (data.type) {
             case 'status':
                 updateConnectionStatus(data.status);
+                // Stop timer when not actively recording/generating
+                if (data.status === 'idle' || data.status === 'generating') {
+                    stopTimer();
+                }
                 if (data.status === 'idle') {
                     copyToClipboard(transcript.value, copyButton);
                 }
@@ -192,10 +197,9 @@ async function startRecording() {
         if (!audioContext) await initAudio(stream);
 
         isRecording = true;
-        await ws.send(JSON.stringify({ 
-            type: 'start_recording', 
-            sampleRate: audioContext.sampleRate 
-        }));
+        const modelSelect = document.getElementById('modelSelect');
+        const selectedModel = modelSelect ? modelSelect.value : 'gpt-realtime';
+        await ws.send(JSON.stringify({ type: 'start_recording', model: selectedModel }));
         
         startTimer();
         recordButton.textContent = 'Stop';
@@ -211,7 +215,8 @@ async function stopRecording() {
     if (!isRecording) return;
     
     isRecording = false;
-    startTimer();
+    // Stop local timer immediately on stop
+    stopTimer();
     
     if (audioBuffer.length > 0 && ws.readyState === WebSocket.OPEN) {
         ws.send(audioBuffer.buffer);
@@ -248,7 +253,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (autoStart) initializeAudioStream();
 });
 // Readability and AI handlers
-readabilityButton.onclick = async () => {
+if (readabilityButton) readabilityButton.onclick = async () => {
     startTimer();
     const inputText = transcript.value.trim();
     if (!inputText) {
@@ -288,7 +293,7 @@ readabilityButton.onclick = async () => {
     }
 };
 
-askAIButton.onclick = async () => {
+if (askAIButton) askAIButton.onclick = async () => {
     startTimer();
     const inputText = transcript.value.trim();
     if (!inputText) {
@@ -318,7 +323,7 @@ askAIButton.onclick = async () => {
     }
 };
 
-correctnessButton.onclick = async () => {
+if (correctnessButton) correctnessButton.onclick = async () => {
     startTimer();
     const inputText = transcript.value.trim();
     if (!inputText) {

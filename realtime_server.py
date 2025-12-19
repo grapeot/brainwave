@@ -102,7 +102,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.send_text(json.dumps({
         "type": "status",
         "status": "idle"  # Set initial status to idle (blue)
-    }))
+    }, ensure_ascii=False))
     
     client = None
     audio_processor = AudioProcessor()
@@ -115,19 +115,22 @@ async def websocket_endpoint(websocket: WebSocket):
     audio_send_lock = asyncio.Lock()
     all_audio_sent = asyncio.Event()
     all_audio_sent.set()  # Initially set since no audio is pending
-    marker_prefix = "下面是语音识别转录结果：\n\n"
+    marker_prefix = "This is the transcription in the original language:\n\n"
     max_prefix_deltas = 20
     response_buffer = []
     marker_seen = False
     delta_counter = 0
     
-    async def initialize_openai():
+    async def initialize_openai(model: str = None):
         nonlocal client
         try:
             # Clear the ready flag while initializing
             openai_ready.clear()
             
-            client = OpenAIRealtimeAudioTextClient(os.getenv("OPENAI_API_KEY"))
+            # Use provided model or fall back to default
+            from config import OPENAI_REALTIME_MODEL
+            selected_model = model if model else OPENAI_REALTIME_MODEL
+            client = OpenAIRealtimeAudioTextClient(os.getenv("OPENAI_API_KEY"), model=selected_model)
             await client.connect()
             logger.info("Successfully connected to OpenAI client")
             
@@ -151,7 +154,7 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_text(json.dumps({
                 "type": "status",
                 "status": "connected"
-            }))
+            }, ensure_ascii=False))
             return True
         except Exception as e:
             logger.error(f"Failed to connect to OpenAI: {e}")
@@ -159,7 +162,7 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_text(json.dumps({
                 "type": "error",
                 "content": "Failed to initialize OpenAI connection"
-            }))
+            }, ensure_ascii=False))
             return False
 
     # Move the handler definitions here (before initialize_openai)
@@ -169,7 +172,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 "type": "text",
                 "content": content,
                 "isNewResponse": False
-            }))
+            }, ensure_ascii=False))
 
     async def flush_buffer(with_warning: bool = False):
         nonlocal response_buffer
@@ -231,7 +234,7 @@ async def websocket_endpoint(websocket: WebSocket):
             "type": "text",
             "content": "",
             "isNewResponse": True
-        }))
+        }, ensure_ascii=False))
         logger.info("Handled response.created")
 
     async def handle_error(data):
@@ -240,7 +243,7 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.send_text(json.dumps({
             "type": "error",
             "content": error_msg
-        }))
+        }, ensure_ascii=False))
         logger.info("Handled error message from OpenAI")
 
     async def handle_response_done(data):
@@ -259,7 +262,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_text(json.dumps({
                     "type": "status",
                     "status": "idle"
-                }))
+                }, ensure_ascii=False))
                 logger.info("Connection closed after response completion")
             except Exception as e:
                 logger.error(f"Error closing client after response done: {str(e)}")
@@ -301,7 +304,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 await websocket.send_text(json.dumps({
                                     "type": "status",
                                     "status": "connected"
-                                }))
+                                }, ensure_ascii=False))
                                 logger.debug(f"Sent audio chunk, size: {len(processed_audio)} bytes")
                             finally:
                                 # Mark operation as complete
@@ -326,8 +329,10 @@ async def websocket_endpoint(websocket: WebSocket):
                             await websocket.send_text(json.dumps({
                                 "type": "status",
                                 "status": "connecting"
-                            }))
-                            if not await initialize_openai():
+                            }, ensure_ascii=False))
+                            # Extract model from message, if provided
+                            model = msg.get("model")
+                            if not await initialize_openai(model=model):
                                 continue
                             recording_stopped.clear()
                             pending_audio_chunks.clear()
@@ -379,7 +384,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 await websocket.send_text(json.dumps({
                                     "type": "status",
                                     "status": "connected"
-                                }))
+                                }, ensure_ascii=False))
 
                 except asyncio.TimeoutError:
                     logger.debug("No message received for 30 seconds")

@@ -4,6 +4,7 @@ import json
 import websockets
 from unittest.mock import AsyncMock, patch, MagicMock
 from openai_realtime_client import OpenAIRealtimeAudioTextClient
+from prompts import PROMPTS
 
 @pytest.fixture
 def api_key():
@@ -29,22 +30,24 @@ async def test_connect_success(client):
         assert len(client.handlers) > 0
         assert "default" in client.handlers
         
-        # Verify the session update message was sent
+        # Verify the session update message was sent for conversation mode with server_vad and transcription
         expected_update = {
             "type": "session.update",
             "session": {
                 "modalities": ["text"],
                 "input_audio_format": "pcm16",
-                "input_audio_transcription": None,
+                "input_audio_transcription": {"model": "gpt-4o-transcribe"},
                 "turn_detection": None,
+                "instructions": PROMPTS['paraphrase-gpt-realtime-enhanced']
             }
         }
-        mock_ws.send.assert_awaited_with(json.dumps(expected_update))
+        mock_ws.send.assert_awaited_with(json.dumps(expected_update, ensure_ascii=False))
 
 @pytest.mark.asyncio
 async def test_send_audio(client):
     mock_ws = AsyncMock()
     mock_ws.open = True
+    mock_ws.closed = False
     client.ws = mock_ws
     
     test_audio = b"test_audio_data"
@@ -60,6 +63,7 @@ async def test_send_audio(client):
 async def test_commit_audio(client):
     mock_ws = AsyncMock()
     mock_ws.open = True
+    mock_ws.closed = False
     client.ws = mock_ws
     
     await client.commit_audio()
@@ -71,6 +75,7 @@ async def test_commit_audio(client):
 async def test_clear_audio_buffer(client):
     mock_ws = AsyncMock()
     mock_ws.open = True
+    mock_ws.closed = False
     client.ws = mock_ws
     
     await client.clear_audio_buffer()
@@ -82,6 +87,7 @@ async def test_clear_audio_buffer(client):
 async def test_start_response(client):
     mock_ws = AsyncMock()
     mock_ws.open = True
+    mock_ws.closed = False
     client.ws = mock_ws
     
     test_instructions = "test instructions"

@@ -191,6 +191,58 @@ Comprehensive logging is integrated throughout the backend components to monitor
 - **Data Transmission:** Logs the size and status of audio chunks being processed and sent.
 - **Error Reporting:** Captures and logs any errors or exceptions, facilitating easier debugging and maintenance.
 
+### 6. **Local Storage Replay Feature (IndexedDB)**
+
+Brainwave includes a browser-based replay feature that allows users to replay their most recent recording session if recognition fails, network is interrupted, or backend errors occur.
+
+#### Overview
+
+- **Purpose:** Persist audio chunks and control events (start/stop) to browser local storage during recording, enabling replay without re-speaking.
+- **Storage:** Uses IndexedDB (not localStorage) for binary data support and larger capacity (typically GB-level).
+- **Scope:** Only keeps the most recent session by default to avoid unlimited storage usage. If local storage is unavailable, real-time recording still works (but replay is disabled).
+
+#### Technical Details
+
+**Storage Model:**
+- **Database:** `brainwave-replay`, version `1`
+- **Object Stores:**
+  - `sessions` (keyPath: `id`, autoIncrement: true)
+    - Fields: `id`, `createdAt`, `status` ("recording"|"completed"|"failed"), `sampleRate` (default 24000), `channelCount` (1), `durationMs`, `error`
+  - `chunks` (keyPath: `id`, autoIncrement: true, index `sessionId`)
+    - Fields: `sessionId`, `seq`, `deltaMs` (time offset from start for replay throttling), `kind` ("start"|"audio"|"stop"|"meta"), `payload` (Blob or ArrayBuffer), `byteLength`
+
+**Storage Size Estimation:**
+- 24000 sample rate, 16-bit mono => 48KB/second
+- Only keeps the most recent N sessions (e.g., 5 sessions or total < 100MB)
+- Oldest sessions and their chunks are deleted when quota is exceeded
+
+**Recording Workflow:**
+1. On `startRecording` success: Create session, write a `kind: "start"` record with `deltaMs = 0`
+2. During `onaudioprocess`: When sending each 24k-sample chunk to backend, also call `appendChunk(sessionId, { seq, deltaMs, kind: "audio", payload: sendBuffer })`. `deltaMs` is calculated using `performance.now()` relative to session start to maintain original timing.
+3. On `stopRecording`: After sending the last chunk, write a `kind: "stop"` record, update `sessions.status = "completed"`, and record `durationMs`
+4. Cleanup: After recording ends, trigger `enforceQuota({ maxSessions: 5, maxBytes: 100 * 1024 * 1024 })`
+5. Fallback: If IndexedDB initialization fails (no permission, incognito mode quota restrictions, etc.), set an in-memory fallback flag, only send in real-time without prompts, and disable the replay button
+
+**Replay Workflow:**
+1. **Session Selection:** Default to replaying the most recent `status = "completed"` session
+2. **State Check:** If currently recording/generating, prompt user to stop before replaying
+3. **Connection:** Create a new WebSocket connection (or reuse existing, ensuring backend accepts new start/stop sequences; prefer new connection)
+4. **Replay Steps:**
+   - Send `kind: "start"` control message (consistent with current protocol, e.g., `{type: "start_recording"}`)
+   - Send audio chunks in recorded order
+   - Audio chunk sending uses `setTimeout` based on `deltaMs` timing; if timing is too dense, set minimum interval of 5-10ms to prevent blocking
+   - Send `kind: "stop"` control message at the end
+5. **Error Handling:** On errors (WebSocket closed, backend 4xx/5xx, etc.), log and prompt but keep session data for retry
+
+**Backend Compatibility:**
+- WebSocket protocol remains consistent: `start_recording` control message -> binary PCM chunks -> `stop_recording`. Replay follows the same protocol.
+- Backend allows multiple new connections from the same browser in a short time; if not allowed, frontend should wait for existing connection to return to idle before replaying
+
+**UI/UX:**
+- Add a "Replay Last Recording" button near the record button, with states: available/disabled/replaying
+- Disable record button during replay, show progress (based on `deltaMs` and chunk count)
+- If local storage is unavailable or quota insufficient, show reason in button tooltip
+
 ---
 
 ## Testing
