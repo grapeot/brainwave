@@ -2,6 +2,7 @@
 let ws, audioContext, processor, source, stream;
 let isRecording = false;
 let isReplaying = false;
+let isStopping = false; // Flag to allow final audio processing during stop
 let timerInterval;
 let startTime;
 let audioBuffer = new Int16Array(0);
@@ -92,6 +93,61 @@ async function initIndexedDB() {
         
         request.onsuccess = () => {
             db = request.result;
+            
+            // Check if required object stores exist
+            if (!db.objectStoreNames.contains('sessions') || !db.objectStoreNames.contains('chunks')) {
+                // Close and delete the database, then reopen to trigger onupgradeneeded
+                db.close();
+                const deleteRequest = indexedDB.deleteDatabase('brainwave-replay');
+                deleteRequest.onsuccess = () => {
+                    // Reopen database - this will trigger onupgradeneeded
+                    const reopenRequest = indexedDB.open('brainwave-replay', 1);
+                    reopenRequest.onsuccess = () => {
+                        db = reopenRequest.result;
+                        storageAvailable = true;
+                        if (replayButton) {
+                            replayButton.disabled = false;
+                        }
+                        updateReplayButtonState();
+                        resolve(true);
+                    };
+                    reopenRequest.onerror = () => {
+                        console.warn('Failed to reopen IndexedDB after cleanup');
+                        storageAvailable = false;
+                        if (replayButton) {
+                            replayButton.disabled = true;
+                            replayButton.title = 'Local storage not available';
+                        }
+                        resolve(false);
+                    };
+                    reopenRequest.onupgradeneeded = (event) => {
+                        const db = event.target.result;
+                        // Create sessions store
+                        if (!db.objectStoreNames.contains('sessions')) {
+                            const sessionsStore = db.createObjectStore('sessions', { keyPath: 'id', autoIncrement: true });
+                            sessionsStore.createIndex('status', 'status', { unique: false });
+                            sessionsStore.createIndex('createdAt', 'createdAt', { unique: false });
+                        }
+                        // Create chunks store
+                        if (!db.objectStoreNames.contains('chunks')) {
+                            const chunksStore = db.createObjectStore('chunks', { keyPath: 'id', autoIncrement: true });
+                            chunksStore.createIndex('sessionId', 'sessionId', { unique: false });
+                            chunksStore.createIndex('seq', 'seq', { unique: false });
+                        }
+                    };
+                };
+                deleteRequest.onerror = () => {
+                    console.warn('Failed to delete corrupted IndexedDB');
+                    storageAvailable = false;
+                    if (replayButton) {
+                        replayButton.disabled = true;
+                        replayButton.title = 'Local storage not available';
+                    }
+                    resolve(false);
+                };
+                return;
+            }
+            
             storageAvailable = true;
             if (replayButton) {
                 replayButton.disabled = false;
@@ -124,7 +180,8 @@ async function initIndexedDB() {
 function createAudioProcessor() {
     processor = audioContext.createScriptProcessor(4096, 1, 1);
     processor.onaudioprocess = async (e) => {
-        if (!isRecording) return;
+        // Allow processing if recording OR if stopping (to capture final audio)
+        if (!isRecording && !isStopping) return;
         
         const inputData = e.inputBuffer.getChannelData(0);
         const pcmData = new Int16Array(inputData.length);
@@ -453,7 +510,7 @@ async function startRecording() {
 
         isRecording = true;
         const modelSelect = document.getElementById('modelSelect');
-        const selectedModel = modelSelect ? modelSelect.value : 'gpt-realtime';
+        const selectedModel = modelSelect ? modelSelect.value : 'gpt-realtime-mini-2025-12-15';
         
         // Create session in IndexedDB
         if (storageAvailable) {
@@ -476,12 +533,19 @@ async function startRecording() {
 async function stopRecording() {
     if (!isRecording) return;
     
+    // Set stopping flag first to allow final audio processing
+    isStopping = true;
     isRecording = false;
     const durationMs = performance.now() - sessionStartTime;
     
     // Stop local timer immediately on stop
     stopTimer();
     
+    // Wait a bit to allow any in-flight onaudioprocess callbacks to complete
+    // This ensures we capture the last bit of audio data
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    // Send any remaining audio buffer
     if (audioBuffer.length > 0 && ws.readyState === WebSocket.OPEN) {
         const sendBuffer = audioBuffer.slice();
         ws.send(sendBuffer.buffer);
@@ -501,6 +565,10 @@ async function stopRecording() {
         audioBuffer = new Int16Array(0);
     }
     
+    // Clear stopping flag
+    isStopping = false;
+    
+    // Wait a bit more to ensure all audio is sent before stopping
     await new Promise(resolve => setTimeout(resolve, 500));
     await ws.send(JSON.stringify({ type: 'stop_recording' }));
     
@@ -565,7 +633,7 @@ async function replayLastRecording() {
         
         // Send start_recording message
         const modelSelect = document.getElementById('modelSelect');
-        const selectedModel = modelSelect ? modelSelect.value : 'gpt-realtime';
+        const selectedModel = modelSelect ? modelSelect.value : 'gpt-realtime-mini-2025-12-15';
         await ws.send(JSON.stringify({ type: 'start_recording', model: selectedModel }));
         
         // Wait a bit for backend to initialize
