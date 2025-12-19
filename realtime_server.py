@@ -115,7 +115,7 @@ async def websocket_endpoint(websocket: WebSocket):
     audio_send_lock = asyncio.Lock()
     all_audio_sent = asyncio.Event()
     all_audio_sent.set()  # Initially set since no audio is pending
-    marker_prefix = "下面是语音识别转录结果：\n\n"
+    marker_prefix = "下面是不改变语言的语音识别结果：\n\n"
     max_prefix_deltas = 20
     response_buffer = []
     marker_seen = False
