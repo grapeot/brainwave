@@ -10,6 +10,13 @@
         <div id="connectionStatus" class="connection-status"></div>
         <button id="themeToggle" class="theme-toggle">🌙</button>
         <h1>Brainwave</h1>
+        <div style="text-align: center; margin-bottom: 15px;">
+            <label for="modelSelect" style="margin-right: 10px;">Model:</label>
+            <select id="modelSelect" style="padding: 5px 10px; font-size: 1rem; border-radius: 4px;">
+                <option value="gpt-realtime">GPT Realtime</option>
+                <option value="gpt-realtime-mini-2025-12-15">gpt-realtime-mini-2025-12-15</option>
+            </select>
+        </div>
         <div id="timer" style="text-align: center; margin-bottom: 15px; font-size: 1.2rem;">00:00</div>
         <button id="recordButton">Start</button>
         <div class="transcript-container">
@@ -19,7 +26,7 @@
         <div class="button-container">
             <button id="readabilityButton" class="action-button">Readability</button>
             <button id="correctnessButton" class="action-button">Correctness</button>
-            <button id="askAIButton" class="action-button">Ask AI</button>
+            
         </div>
         <div class="enhanced-transcript-container">
             <textarea id="enhancedTranscript"></textarea>
