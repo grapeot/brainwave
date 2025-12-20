@@ -347,6 +347,9 @@ function initializeWebSocket() {
         // only reset recording state
         isRecording = false;
         isStopping = false;
+        recordButton.textContent = 'Start';
+        recordButton.classList.remove('recording');
+        // Reconnect after a short delay
         setTimeout(initializeWebSocket, 1000);
     };
 }

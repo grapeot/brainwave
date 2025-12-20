@@ -340,14 +340,16 @@ async def websocket_endpoint(websocket: WebSocket):
         nonlocal response_buffer, marker_seen, delta_counter
         try:
             if websocket.client_state != WebSocketState.CONNECTED:
+                logger.warning("WebSocket not connected, ignoring text delta")
                 return
 
             delta = data.get("delta", "")
+            logger.debug(f"Received text delta: {repr(delta[:50])} (marker_seen={marker_seen}, buffer_size={len(response_buffer)}, delta_counter={delta_counter})")
 
             if marker_seen:
                 if delta:
                     await emit_text_delta(delta)
-                    logger.info("Handled response.text.delta (passthrough)")
+                    logger.info(f"Handled response.text.delta (passthrough): {repr(delta[:50])}")
                 return
 
             if delta:
@@ -362,7 +364,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 remaining = joined[marker_index + len(marker_prefix):]
                 response_buffer = []
                 await emit_text_delta(remaining)
-                logger.info("Handled response.text.delta (marker detected)")
+                logger.info(f"Handled response.text.delta (marker detected), emitted: {repr(remaining[:50])}")
                 return
 
             if delta_counter >= max_prefix_deltas:
@@ -370,7 +372,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await flush_buffer(with_warning=True)
                 logger.warning("Marker prefix not detected after max deltas; emitted buffered text.")
             else:
-                logger.info("Handled response.text.delta (buffering)")
+                logger.debug(f"Handled response.text.delta (buffering), total buffer length: {len(joined)}")
         except Exception as e:
             logger.error(f"Error in handle_text_delta: {str(e)}", exc_info=True)
 
@@ -380,6 +382,7 @@ async def websocket_endpoint(websocket: WebSocket):
         response_buffer = []
         marker_seen = False
         delta_counter = 0
+        logger.info(f"Handled response.created, clearing buffer and resetting marker state")
         if clear_on_next_response:
             await websocket.send_text(json.dumps({
                 "type": "text",
@@ -405,8 +408,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
     async def handle_response_done(data):
         nonlocal client, response_buffer, marker_seen, should_close_connection
-        logger.info("Handled response.done")
+        logger.info(f"Handled response.done (marker_seen={marker_seen}, buffer_size={len(response_buffer)})")
         if not marker_seen and response_buffer:
+            logger.info("Flushing remaining buffer content")
             await flush_buffer()
             marker_seen = True
         
@@ -439,6 +443,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Check if we should close the connection (single-turn mode)
                 if should_close_connection.is_set():
                     logger.info("Closing connection after response completion (single-turn mode)")
+                    # Reset the flag before closing so next connection can work
+                    should_close_connection.clear()
                     break
                 
                 if websocket.client_state == WebSocketState.DISCONNECTED:
@@ -478,6 +484,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     msg = json.loads(data["text"])
                     
                     if msg.get("type") == "start_recording":
+                        # Reset connection close flag for new recording session
+                        should_close_connection.clear()
+                        
                         # Update status to connecting while initializing realtime client
                         await websocket.send_text(json.dumps({
                             "type": "status",
@@ -522,11 +531,15 @@ async def websocket_endpoint(websocket: WebSocket):
                             is_recording = False
                             try:
                                 await client.commit_audio()
+                                logger.info("Audio committed, starting response...")
                                 # Use text-only modalities for x.ai if configured
-                                modalities = None
                                 if isinstance(client, XAIRealtimeAudioTextClient):
                                     modalities = XAI_REALTIME_MODALITIES
-                                await client.start_response(PROMPTS['paraphrase-gpt-realtime-enhanced'], modalities=modalities)
+                                    await client.start_response(PROMPTS['paraphrase-gpt-realtime-enhanced'], modalities=modalities)
+                                else:
+                                    # OpenAI client doesn't accept modalities parameter
+                                    await client.start_response(PROMPTS['paraphrase-gpt-realtime-enhanced'])
+                                logger.info("Response started successfully")
                             except Exception as e:
                                 logger.error(f"Error committing/starting response on stop: {str(e)}", exc_info=True)
                                 # If we fail to kick off a response, surface that we're no longer recording
