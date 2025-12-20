@@ -220,11 +220,52 @@ function createAudioProcessor() {
 }
 
 async function initAudio(stream) {
-    audioContext = new AudioContext();
-    source = audioContext.createMediaStreamSource(stream);
-    processor = createAudioProcessor();
-    source.connect(processor);
-    processor.connect(audioContext.destination);
+    console.log('Initializing AudioContext...');
+    // Clean up existing audio context if any
+    if (audioContext && audioContext.state !== 'closed') {
+        try {
+            await audioContext.close();
+        } catch (e) {
+            console.warn('Error closing existing audio context:', e);
+        }
+    }
+    
+    try {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        source = audioContext.createMediaStreamSource(stream);
+        processor = createAudioProcessor();
+        source.connect(processor);
+        processor.connect(audioContext.destination);
+        
+        if (audioContext.state === 'suspended') {
+            await audioContext.resume();
+        }
+    } catch (e) {
+        console.error('initAudio failed:', e);
+        throw e;
+    }
+}
+
+function cleanupAudioResources() {
+    // Stop all tracks in the stream
+    if (stream) {
+        stream.getTracks().forEach(track => {
+            track.stop();
+        });
+        stream = null;
+    }
+    
+    // Close audio context
+    if (audioContext && audioContext.state !== 'closed') {
+        audioContext.close().catch(e => {
+            console.warn('Error closing audio context:', e);
+        });
+        audioContext = null;
+    }
+    
+    source = null;
+    processor = null;
+    streamInitialized = false;
 }
 
 // WebSocket handling
@@ -255,10 +296,16 @@ function initializeWebSocket() {
     ws = new WebSocket(`${protocol}://${window.location.host}/api/v1/ws`);
     
     ws.onopen = () => {
+        console.log('WebSocket connected');
         wsConnected = true;
         // Set initial UI state to idle (blue) when socket opens
         updateConnectionStatus('idle');
         if (autoStart && !isRecording && !isAutoStarted) startRecording();
+    };
+    
+    ws.onerror = (error) => {
+        console.error('WebSocket error:', error);
+        updateConnectionStatus(false);
     };
     
     ws.onmessage = (event) => {
@@ -296,6 +343,13 @@ function initializeWebSocket() {
     ws.onclose = () => {
         wsConnected = false;
         updateConnectionStatus(false);
+        // Do NOT clean up audio resources here to allow reuse of microphone
+        // only reset recording state
+        isRecording = false;
+        isStopping = false;
+        recordButton.textContent = 'Start';
+        recordButton.classList.remove('recording');
+        // Reconnect after a short delay
         setTimeout(initializeWebSocket, 1000);
     };
 }
@@ -489,35 +543,81 @@ async function getSessionChunks(sessionId) {
 async function startRecording() {
     if (isRecording || isReplaying) return;
     
+    // Check WebSocket connection
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        alert('WebSocket is not connected. Please wait a moment or refresh the page.');
+        return;
+    }
+    
     try {
         transcript.value = '';
         enhancedTranscript.value = '';
 
-        if (!streamInitialized) {
-            stream = await navigator.mediaDevices.getUserMedia({ 
-                audio: {
-                    channelCount: 1,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true
-                } 
-            });
-            streamInitialized = true;
+        // Check if stream is still valid, reinitialize ONLY if needed
+        let streamActive = false;
+        try {
+            streamActive = streamInitialized && stream && stream.active && 
+                          stream.getTracks().length > 0 && 
+                          stream.getTracks().every(track => track.readyState === 'live');
+        } catch (e) {
+            console.warn('Error checking stream status:', e);
+            streamActive = false;
+        }
+        
+        if (!streamActive) {
+            console.log('Reinitializing microphone stream...');
+            cleanupAudioResources();
+            
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    } 
+                });
+                streamInitialized = true;
+            } catch (err) {
+                console.error('getUserMedia error:', err);
+                throw new Error('Could not access microphone. Please check permissions.');
+            }
         }
 
         if (!stream) throw new Error('Failed to initialize audio stream');
-        if (!audioContext) await initAudio(stream);
+        
+        // Ensure AudioContext is active
+        if (!audioContext || audioContext.state === 'closed') {
+            await initAudio(stream);
+        } else if (audioContext.state === 'suspended') {
+            await audioContext.resume();
+        }
 
         isRecording = true;
         const modelSelect = document.getElementById('modelSelect');
         const selectedModel = modelSelect ? modelSelect.value : 'gpt-realtime-mini-2025-12-15';
+        
+        // Determine provider and model based on selection
+        let provider = 'openai';
+        let model = selectedModel;
+        
+        if (selectedModel === 'xai-grok') {
+            provider = 'xai';
+            model = null;  // x.ai doesn't use model parameter
+        }
         
         // Create session in IndexedDB
         if (storageAvailable) {
             await createSession();
         }
         
-        await ws.send(JSON.stringify({ type: 'start_recording', model: selectedModel }));
+        const startMessage = { 
+            type: 'start_recording', 
+            provider: provider,
+            model: model
+        };
+        console.log('Sending start_recording:', startMessage);
+        await ws.send(JSON.stringify(startMessage));
         
         startTimer();
         recordButton.textContent = 'Stop';
@@ -634,7 +734,23 @@ async function replayLastRecording() {
         // Send start_recording message
         const modelSelect = document.getElementById('modelSelect');
         const selectedModel = modelSelect ? modelSelect.value : 'gpt-realtime-mini-2025-12-15';
-        await ws.send(JSON.stringify({ type: 'start_recording', model: selectedModel }));
+        
+        // Determine provider and model based on selection
+        let provider = 'openai';
+        let model = selectedModel;
+        
+        if (selectedModel === 'xai-grok') {
+            provider = 'xai';
+            model = null;
+        }
+        
+        const startMessage = { 
+            type: 'start_recording', 
+            provider: provider,
+            model: model
+        };
+        console.log('Sending start_recording:', startMessage);
+        await ws.send(JSON.stringify(startMessage));
         
         // Wait a bit for backend to initialize
         await new Promise(resolve => setTimeout(resolve, 200));
