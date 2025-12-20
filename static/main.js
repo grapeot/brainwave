@@ -220,11 +220,42 @@ function createAudioProcessor() {
 }
 
 async function initAudio(stream) {
+    // Clean up existing audio context if any
+    if (audioContext && audioContext.state !== 'closed') {
+        try {
+            await audioContext.close();
+        } catch (e) {
+            console.warn('Error closing existing audio context:', e);
+        }
+    }
+    
     audioContext = new AudioContext();
     source = audioContext.createMediaStreamSource(stream);
     processor = createAudioProcessor();
     source.connect(processor);
     processor.connect(audioContext.destination);
+}
+
+function cleanupAudioResources() {
+    // Stop all tracks in the stream
+    if (stream) {
+        stream.getTracks().forEach(track => {
+            track.stop();
+        });
+        stream = null;
+    }
+    
+    // Close audio context
+    if (audioContext && audioContext.state !== 'closed') {
+        audioContext.close().catch(e => {
+            console.warn('Error closing audio context:', e);
+        });
+        audioContext = null;
+    }
+    
+    source = null;
+    processor = null;
+    streamInitialized = false;
 }
 
 // WebSocket handling
@@ -296,6 +327,8 @@ function initializeWebSocket() {
     ws.onclose = () => {
         wsConnected = false;
         updateConnectionStatus(false);
+        // Clean up audio resources when connection closes
+        cleanupAudioResources();
         setTimeout(initializeWebSocket, 1000);
     };
 }
@@ -493,7 +526,11 @@ async function startRecording() {
         transcript.value = '';
         enhancedTranscript.value = '';
 
-        if (!streamInitialized) {
+        // Check if stream is still valid, reinitialize if needed
+        if (!streamInitialized || !stream || stream.getTracks().some(track => track.readyState === 'ended')) {
+            // Clean up existing resources
+            cleanupAudioResources();
+            
             stream = await navigator.mediaDevices.getUserMedia({ 
                 audio: {
                     channelCount: 1,
@@ -506,7 +543,9 @@ async function startRecording() {
         }
 
         if (!stream) throw new Error('Failed to initialize audio stream');
-        if (!audioContext) await initAudio(stream);
+        if (!audioContext || audioContext.state === 'closed') {
+            await initAudio(stream);
+        }
 
         isRecording = true;
         const modelSelect = document.getElementById('modelSelect');
