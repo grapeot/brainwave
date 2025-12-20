@@ -418,6 +418,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 try:
                     # Add timeout to prevent infinite waiting
                     data = await asyncio.wait_for(websocket.receive(), timeout=30.0)
+                except asyncio.CancelledError:
+                    logger.info("Receive messages task cancelled")
+                    raise
                     
                     if "bytes" in data:
                         processed_audio = audio_processor.process_audio_chunk(data["bytes"])
@@ -511,26 +514,33 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.info("Receive messages loop ended")
 
     async def send_audio_messages():
-        while True:
-            try:
-                processed_audio = await audio_queue.get()
-                if processed_audio is None:
-                    break
-                
-                # Add validation
-                if len(processed_audio) == 0:
-                    logger.warning("Empty audio chunk received, skipping")
-                    continue
-                
-                # Append the processed audio to the buffer
-                audio_buffer.append(processed_audio)
+        try:
+            while True:
+                try:
+                    processed_audio = await audio_queue.get()
+                    if processed_audio is None:
+                        break
+                    
+                    # Add validation
+                    if len(processed_audio) == 0:
+                        logger.warning("Empty audio chunk received, skipping")
+                        continue
+                    
+                    # Append the processed audio to the buffer
+                    audio_buffer.append(processed_audio)
 
-                await client.send_audio(processed_audio)
-                logger.info(f"Audio chunk sent to OpenAI client, size: {len(processed_audio)} bytes")
-                
-            except Exception as e:
-                logger.error(f"Error in send_audio_messages: {str(e)}", exc_info=True)
-                break
+                    await client.send_audio(processed_audio)
+                    logger.info(f"Audio chunk sent to OpenAI client, size: {len(processed_audio)} bytes")
+                    
+                except asyncio.CancelledError:
+                    logger.info("Send audio messages task cancelled")
+                    raise
+                except Exception as e:
+                    logger.error(f"Error in send_audio_messages: {str(e)}", exc_info=True)
+                    break
+        except asyncio.CancelledError:
+            logger.info("Send audio messages task cancelled")
+            raise
 
         # After processing all audio, set the event
         recording_stopped.set()
@@ -545,6 +555,18 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"Error in WebSocket connection: {e}", exc_info=True)
     finally:
+        # Cancel background tasks before cleanup
+        receive_task.cancel()
+        send_task.cancel()
+        
+        # Wait for tasks to be cancelled (with timeout)
+        try:
+            await asyncio.wait_for(asyncio.gather(receive_task, send_task, return_exceptions=True), timeout=1.0)
+        except asyncio.TimeoutError:
+            logger.warning("Tasks did not cancel within timeout")
+        except Exception as e:
+            logger.debug(f"Error cancelling tasks: {e}")
+        
         if client:
             await client.close()
         if websocket.client_state != WebSocketState.DISCONNECTED:
