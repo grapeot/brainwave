@@ -27,7 +27,6 @@ from config import (
     OPENAI_REALTIME_MODALITIES,
     OPENAI_REALTIME_SESSION_TTL_SEC,
     XAI_API_KEY,
-    XAI_REALTIME_VOICE,
     XAI_REALTIME_MODALITIES,
     REALTIME_PROVIDER,
 )
@@ -207,7 +206,7 @@ class AudioProcessor:
 async def websocket_endpoint(websocket: WebSocket):
     logger.info("New WebSocket connection attempt")
     await websocket.accept()
-    logger.info("WebSocket connection accepted")
+    logger.info("WebSocket connection accepted, starting receive_messages task")
     
     # Add initial status update here
     await websocket.send_text(json.dumps({
@@ -228,7 +227,6 @@ async def websocket_endpoint(websocket: WebSocket):
     response_buffer = []
     marker_seen = False
     delta_counter = 0
-    should_close_connection = asyncio.Event()  # Flag to signal connection should be closed
 
     async def emit_text_delta(content: str):
         if content and websocket.client_state == WebSocketState.CONNECTED:
@@ -244,20 +242,32 @@ async def websocket_endpoint(websocket: WebSocket):
             return
         buffered_text = "".join(response_buffer)
         response_buffer = []
+        # Try to remove marker prefix (with or without trailing newlines)
         if buffered_text.startswith(marker_prefix):
             buffered_text = buffered_text[len(marker_prefix):]
+        elif buffered_text.startswith(marker_prefix.rstrip('\n')):
+            # Handle case where prefix doesn't have trailing newlines
+            buffered_text = buffered_text[len(marker_prefix.rstrip('\n')):].lstrip('\n')
+        # Also check if prefix appears anywhere in the text
+        marker_index = buffered_text.find(marker_prefix)
+        if marker_index != -1:
+            buffered_text = buffered_text[marker_index + len(marker_prefix):]
+        else:
+            marker_index = buffered_text.find(marker_prefix.rstrip('\n'))
+            if marker_index != -1:
+                buffered_text = buffered_text[marker_index + len(marker_prefix.rstrip('\n')):].lstrip('\n')
         if with_warning and not buffered_text:
             logger.warning("Buffered text discarded after removing marker prefix.")
         await emit_text_delta(buffered_text)
     
-    async def create_realtime_client(provider: str = None, model: str = None, voice: str = None) -> RealtimeClientBase:
+    async def create_realtime_client(provider: str = None, model: str = None) -> RealtimeClientBase:
         """
         Factory function to create appropriate realtime client.
         
         Args:
             provider: Provider name ("openai" or "xai"). Defaults to REALTIME_PROVIDER config.
             model: Model name (for OpenAI). Defaults to OPENAI_REALTIME_MODEL.
-            voice: Voice name (for x.ai). Defaults to XAI_REALTIME_VOICE.
+                      For x.ai, use "xai-grok", "xai", or any model name starting with "grok-".
         
         Returns:
             RealtimeClientBase instance
@@ -268,9 +278,8 @@ async def websocket_endpoint(websocket: WebSocket):
             api_key = XAI_API_KEY
             if not api_key:
                 raise ValueError("XAI_API_KEY not set in environment variables")
-            selected_voice = voice or XAI_REALTIME_VOICE
-            logger.info(f"Creating x.ai client with voice: {selected_voice}")
-            return XAIRealtimeAudioTextClient(api_key, voice=selected_voice)
+            logger.info("Creating x.ai client (text-only mode, no voice needed)")
+            return XAIRealtimeAudioTextClient(api_key)
         else:  # default to openai
             api_key = OPENAI_API_KEY
             if not api_key:
@@ -286,10 +295,15 @@ async def websocket_endpoint(websocket: WebSocket):
             openai_ready.clear()
             
             # Create client using factory function
-            client = await create_realtime_client(provider=provider, model=model, voice=voice)
-            await client.connect()
+            client = await create_realtime_client(provider=provider, model=model)
             
+            # Pass appropriate modalities based on provider
             provider_name = provider or REALTIME_PROVIDER
+            if provider_name == "xai":
+                await client.connect(modalities=XAI_REALTIME_MODALITIES)
+            else:
+                await client.connect(modalities=OPENAI_REALTIME_MODALITIES)
+            
             logger.info(f"Successfully connected to {provider_name} client")
             
             # Register handlers after client is initialized
@@ -349,7 +363,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if marker_seen:
                 if delta:
                     await emit_text_delta(delta)
-                    logger.info(f"Handled response.text.delta (passthrough): {repr(delta[:50])}")
+                    logger.debug(f"Handled response.text.delta (passthrough): {repr(delta[:50])}")
                 return
 
             if delta:
@@ -357,7 +371,21 @@ async def websocket_endpoint(websocket: WebSocket):
                 delta_counter += 1
 
             joined = "".join(response_buffer)
+            # Try to find marker prefix (with or without newlines)
             marker_index = joined.find(marker_prefix)
+            # Also try without the trailing newlines in case x.ai returns differently
+            if marker_index == -1:
+                marker_prefix_no_newline = marker_prefix.rstrip('\n')
+                marker_index = joined.find(marker_prefix_no_newline)
+                if marker_index != -1:
+                    # Found prefix without trailing newlines, skip past it
+                    marker_seen = True
+                    remaining = joined[marker_index + len(marker_prefix_no_newline):].lstrip('\n')
+                    response_buffer = []
+                    if remaining:
+                        await emit_text_delta(remaining)
+                    logger.info(f"Handled response.text.delta (marker detected without newline), emitted: {repr(remaining[:50])}")
+                    return
 
             if marker_index != -1:
                 marker_seen = True
@@ -407,7 +435,7 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info("Handled error message from OpenAI")
 
     async def handle_response_done(data):
-        nonlocal client, response_buffer, marker_seen, should_close_connection
+        nonlocal client, response_buffer, marker_seen
         logger.info(f"Handled response.done (marker_seen={marker_seen}, buffer_size={len(response_buffer)})")
         if not marker_seen and response_buffer:
             logger.info("Flushing remaining buffer content")
@@ -425,9 +453,16 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception as e:
             logger.error(f"Error sending status after response done: {str(e)}", exc_info=True)
         
-        # For single-turn conversations, close the connection after response is done
-        logger.info("Response completed, closing connection for single-turn conversation")
-        should_close_connection.set()
+        # Close the OpenAI client connection (not the user WebSocket)
+        # The user WebSocket should remain open for the next request
+        if client:
+            logger.info("Response completed, closing OpenAI client connection")
+            try:
+                await client.close()
+                client = None
+                openai_ready.clear()
+            except Exception as e:
+                logger.error(f"Error closing OpenAI client: {str(e)}", exc_info=True)
 
     async def handle_generic_event(event_type, data):
         logger.info(f"Handled {event_type} with data: {json.dumps(data, ensure_ascii=False)}")
@@ -437,16 +472,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
     async def receive_messages():
         nonlocal client
+        logger.info("receive_messages task started")
         
         try:
             while True:
-                # Check if we should close the connection (single-turn mode)
-                if should_close_connection.is_set():
-                    logger.info("Closing connection after response completion (single-turn mode)")
-                    # Reset the flag before closing so next connection can work
-                    should_close_connection.clear()
-                    break
-                
                 if websocket.client_state == WebSocketState.DISCONNECTED:
                     logger.info("WebSocket client disconnected")
                     openai_ready.clear()
@@ -454,7 +483,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     
                 try:
                     # Add timeout to prevent infinite waiting
+                    logger.info("Waiting for message from client (timeout=30s)...")
                     data = await asyncio.wait_for(websocket.receive(), timeout=30.0)
+                    logger.info(f"Received data from client: {list(data.keys())}")
                 except asyncio.CancelledError:
                     logger.info("Receive messages task cancelled")
                     raise
@@ -482,20 +513,20 @@ async def websocket_endpoint(websocket: WebSocket):
                             
                 elif "text" in data:
                     msg = json.loads(data["text"])
+                    logger.info(f"Received message from client: {msg.get('type')}")
                     
                     if msg.get("type") == "start_recording":
-                        # Reset connection close flag for new recording session
-                        should_close_connection.clear()
+                        logger.info("Processing start_recording request")
                         
                         # Update status to connecting while initializing realtime client
                         await websocket.send_text(json.dumps({
                             "type": "status",
                             "status": "connecting"
                         }, ensure_ascii=False))
-                        # Extract provider, model, and voice from message
+                        # Extract provider and model from message
                         provider = msg.get("provider")  # "openai" or "xai"
                         model = msg.get("model")  # OpenAI model name
-                        voice = msg.get("voice")  # x.ai voice name
+                        # voice parameter is deprecated for x.ai (not needed for text-only output)
                         
                         # Determine provider based on model if not explicitly provided
                         if not provider:
@@ -504,7 +535,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             else:
                                 provider = "openai"
                         
-                        if not await initialize_realtime_client(provider=provider, model=model, voice=voice):
+                        if not await initialize_realtime_client(provider=provider, model=model):
                             continue
                         recording_stopped.clear()
                         pending_audio_chunks.clear()
@@ -563,10 +594,6 @@ async def websocket_endpoint(websocket: WebSocket):
     async def send_audio_messages():
         try:
             while True:
-                # Check if we should close the connection (single-turn mode)
-                if should_close_connection.is_set():
-                    logger.info("Stopping audio sending due to connection close signal")
-                    break
                 
                 try:
                     processed_audio = await audio_queue.get()

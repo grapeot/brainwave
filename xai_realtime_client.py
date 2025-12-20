@@ -19,16 +19,14 @@ logger.setLevel(logging.INFO)
 class XAIRealtimeAudioTextClient(RealtimeClientBase):
     """x.ai Voice Agent API client"""
     
-    def __init__(self, api_key: str, voice: str = "Ara"):
+    def __init__(self, api_key: str):
         """
         Initialize x.ai realtime client.
         
         Args:
             api_key: x.ai API key
-            voice: Voice to use (Ara, Rex, Sal, Eve, Leo). Default: Ara
         """
         super().__init__(api_key)
-        self.voice = voice
         self.base_url = "wss://api.x.ai/v1/realtime"
         self.last_audio_time = None
         self.auto_commit_interval = 5
@@ -38,7 +36,7 @@ class XAIRealtimeAudioTextClient(RealtimeClientBase):
         Connect to x.ai's realtime API and configure the session.
         
         Args:
-            modalities: List of modalities (not used by x.ai, kept for compatibility)
+            modalities: List of modalities. Used to determine if audio output should be configured.
             session_mode: Mode for the session ("conversation" or "transcription")
         """
         headers = {
@@ -76,9 +74,13 @@ class XAIRealtimeAudioTextClient(RealtimeClientBase):
                 conversation_id = response_data.get("conversation", {}).get("id")
                 logger.info(f"Conversation created with ID: {conversation_id}")
         
+        # Determine output modalities (use provided or fall back to config)
+        output_modalities = modalities or XAI_REALTIME_MODALITIES
+        wants_audio_output = "audio" in output_modalities
+        
         # Configure session
+        # Only include audio.output if we want audio output
         session_config_payload = {
-            "voice": self.voice,
             "turn_detection": None,  # Manual turn detection (like OpenAI)
             "audio": {
                 "input": {
@@ -86,15 +88,21 @@ class XAIRealtimeAudioTextClient(RealtimeClientBase):
                         "type": "audio/pcm",
                         "rate": 24000  # 24kHz default
                     }
-                },
-                "output": {
-                    "format": {
-                        "type": "audio/pcm",
-                        "rate": 24000
-                    }
                 }
             }
         }
+        
+        # Only add audio.output if we want audio output
+        if wants_audio_output:
+            session_config_payload["audio"]["output"] = {
+                "format": {
+                    "type": "audio/pcm",
+                    "rate": 24000
+                }
+            }
+            logger.info("Session configured with audio output enabled")
+        else:
+            logger.info("Session configured for text-only output (no audio.output)")
         
         if session_mode == "transcription":
             # No instructions for transcription mode
