@@ -44,6 +44,15 @@
             <button id="copyEnhancedButton" class="copy-button">Copy</button>
         </div>
     </div>
+    <script>
+        console.log('HTML loaded, attempting to load main.js...');
+        window.addEventListener('error', function(e) {
+            if (e.target.tagName === 'SCRIPT') {
+                console.error('Failed to load script:', e.target.src);
+                alert('Failed to load main.js. Please check server logs.');
+            }
+        }, true);
+    </script>
     <script src="static/main.js"></script>
 </body>
 </html>

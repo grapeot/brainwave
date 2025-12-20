@@ -13,9 +13,8 @@ from xai_realtime_client import XAIRealtimeAudioTextClient
 from realtime_client_base import RealtimeClientBase
 from starlette.websockets import WebSocketState
 import wave
-import datetime
 import scipy.signal
-from openai import OpenAI, AsyncOpenAI
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from typing import Generator, Optional
 from llm_processor import get_llm_processor
@@ -63,6 +62,10 @@ class AskAIResponse(BaseModel):
 
 app = FastAPI()
 
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     logger.error("OPENAI_API_KEY is not set in environment variables.")
@@ -70,6 +73,12 @@ if not OPENAI_API_KEY:
 
 # Initialize with a default model
 llm_processor = get_llm_processor("gpt-4o")  # Default processor
+
+@app.get("/static/main.js")
+async def get_main_js():
+    logger.info("Serving main.js via custom route")
+    headers = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
+    return FileResponse("static/main.js", media_type="application/javascript", headers=headers)
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
