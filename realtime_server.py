@@ -29,6 +29,7 @@ from config import (
     OPENAI_REALTIME_SESSION_TTL_SEC,
     XAI_API_KEY,
     XAI_REALTIME_VOICE,
+    XAI_REALTIME_MODALITIES,
     REALTIME_PROVIDER,
 )
 
@@ -218,6 +219,7 @@ async def websocket_endpoint(websocket: WebSocket):
     response_buffer = []
     marker_seen = False
     delta_counter = 0
+    should_close_connection = asyncio.Event()  # Flag to signal connection should be closed
 
     async def emit_text_delta(content: str):
         if content and websocket.client_state == WebSocketState.CONNECTED:
@@ -393,22 +395,26 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info("Handled error message from OpenAI")
 
     async def handle_response_done(data):
-        nonlocal client, response_buffer, marker_seen
+        nonlocal client, response_buffer, marker_seen, should_close_connection
         logger.info("Handled response.done")
         if not marker_seen and response_buffer:
             await flush_buffer()
             marker_seen = True
-        # Do not close OpenAI session; keep it alive for next turn via server VAD
+        
         recording_stopped.set()
         
-        # Update frontend status depending on whether we're actively recording
+        # Update frontend status to idle
         try:
             await websocket.send_text(json.dumps({
                 "type": "status",
-                "status": "connected" if is_recording else "idle"
+                "status": "idle"
             }, ensure_ascii=False))
         except Exception as e:
             logger.error(f"Error sending status after response done: {str(e)}", exc_info=True)
+        
+        # For single-turn conversations, close the connection after response is done
+        logger.info("Response completed, closing connection for single-turn conversation")
+        should_close_connection.set()
 
     async def handle_generic_event(event_type, data):
         logger.info(f"Handled {event_type} with data: {json.dumps(data, ensure_ascii=False)}")
@@ -421,6 +427,11 @@ async def websocket_endpoint(websocket: WebSocket):
         
         try:
             while True:
+                # Check if we should close the connection (single-turn mode)
+                if should_close_connection.is_set():
+                    logger.info("Closing connection after response completion (single-turn mode)")
+                    break
+                
                 if websocket.client_state == WebSocketState.DISCONNECTED:
                     logger.info("WebSocket client disconnected")
                     openai_ready.clear()
@@ -502,7 +513,11 @@ async def websocket_endpoint(websocket: WebSocket):
                             is_recording = False
                             try:
                                 await client.commit_audio()
-                                await client.start_response(PROMPTS['paraphrase-gpt-realtime-enhanced'])
+                                # Use text-only modalities for x.ai if configured
+                                modalities = None
+                                if isinstance(client, XAIRealtimeAudioTextClient):
+                                    modalities = XAI_REALTIME_MODALITIES
+                                await client.start_response(PROMPTS['paraphrase-gpt-realtime-enhanced'], modalities=modalities)
                             except Exception as e:
                                 logger.error(f"Error committing/starting response on stop: {str(e)}", exc_info=True)
                                 # If we fail to kick off a response, surface that we're no longer recording
@@ -526,6 +541,11 @@ async def websocket_endpoint(websocket: WebSocket):
     async def send_audio_messages():
         try:
             while True:
+                # Check if we should close the connection (single-turn mode)
+                if should_close_connection.is_set():
+                    logger.info("Stopping audio sending due to connection close signal")
+                    break
+                
                 try:
                     processed_audio = await audio_queue.get()
                     if processed_audio is None:

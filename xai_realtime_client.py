@@ -9,6 +9,7 @@ import logging
 import asyncio
 from typing import Optional, Callable, Dict, List
 from prompts import PROMPTS
+from config import XAI_REALTIME_MODALITIES
 from realtime_client_base import RealtimeClientBase
 
 logger = logging.getLogger(__name__)
@@ -169,16 +170,25 @@ class XAIRealtimeAudioTextClient(RealtimeClientBase):
         else:
             logger.error("WebSocket is not open. Cannot clear audio buffer.")
     
-    async def start_response(self, instructions: str):
-        """Start a new response with given instructions"""
+    async def start_response(self, instructions: str, modalities: List[str] = None):
+        """
+        Start a new response with given instructions
+        
+        Args:
+            instructions: Instructions for the response
+            modalities: List of output modalities. Defaults to XAI_REALTIME_MODALITIES config.
+                       Use ["text"] for text-only output, ["text", "audio"] for both.
+        """
         if self._is_ws_open():
+            # Use provided modalities or fall back to config
+            output_modalities = modalities or XAI_REALTIME_MODALITIES
             await self.ws.send(json.dumps({
                 "type": "response.create",
                 "response": {
-                    "modalities": ["text", "audio"]
+                    "modalities": output_modalities
                 }
             }))
-            logger.info(f"Started response with instructions: {instructions}")
+            logger.info(f"Started response with modalities: {output_modalities}, instructions: {instructions[:50]}...")
         else:
             logger.error("WebSocket is not open. Cannot start response.")
     
