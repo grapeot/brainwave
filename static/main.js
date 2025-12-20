@@ -512,12 +512,28 @@ async function startRecording() {
         const modelSelect = document.getElementById('modelSelect');
         const selectedModel = modelSelect ? modelSelect.value : 'gpt-realtime-mini-2025-12-15';
         
+        // Determine provider and model/voice based on selection
+        let provider = 'openai';
+        let model = selectedModel;
+        let voice = null;
+        
+        if (selectedModel === 'xai-grok') {
+            provider = 'xai';
+            model = null;  // x.ai doesn't use model parameter
+            voice = 'Ara';  // Default voice for x.ai
+        }
+        
         // Create session in IndexedDB
         if (storageAvailable) {
             await createSession();
         }
         
-        await ws.send(JSON.stringify({ type: 'start_recording', model: selectedModel }));
+        await ws.send(JSON.stringify({ 
+            type: 'start_recording', 
+            provider: provider,
+            model: model,
+            voice: voice
+        }));
         
         startTimer();
         recordButton.textContent = 'Stop';
@@ -634,7 +650,24 @@ async function replayLastRecording() {
         // Send start_recording message
         const modelSelect = document.getElementById('modelSelect');
         const selectedModel = modelSelect ? modelSelect.value : 'gpt-realtime-mini-2025-12-15';
-        await ws.send(JSON.stringify({ type: 'start_recording', model: selectedModel }));
+        
+        // Determine provider and model/voice based on selection
+        let provider = 'openai';
+        let model = selectedModel;
+        let voice = null;
+        
+        if (selectedModel === 'xai-grok') {
+            provider = 'xai';
+            model = null;
+            voice = 'Ara';
+        }
+        
+        await ws.send(JSON.stringify({ 
+            type: 'start_recording', 
+            provider: provider,
+            model: model,
+            voice: voice
+        }));
         
         // Wait a bit for backend to initialize
         await new Promise(resolve => setTimeout(resolve, 200));

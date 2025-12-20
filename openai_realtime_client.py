@@ -8,22 +8,18 @@ import asyncio
 import os
 from prompts import PROMPTS
 from config import OPENAI_REALTIME_MODEL
+from realtime_client_base import RealtimeClientBase
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-class OpenAIRealtimeAudioTextClient:
+class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
     def __init__(self, api_key: str, model: str = OPENAI_REALTIME_MODEL):
-        self.api_key = api_key
+        super().__init__(api_key)
         self.model = model
-        self.ws = None
-        self.session_id = None
         self.base_url = "wss://api.openai.com/v1/realtime"
         self.last_audio_time = None 
         self.auto_commit_interval = 5
-        self.receive_task = None
-        self.handlers: Dict[str, Callable[[dict], asyncio.Future]] = {}
-        self.queue = asyncio.Queue()
         
     async def connect(self, modalities: List[str] = ["text"], session_mode: str = "conversation"):
         """Connect to OpenAI's realtime API and configure the session"""
@@ -85,24 +81,6 @@ class OpenAIRealtimeAudioTextClient:
         # Start the receiver coroutine
         self.receive_task = asyncio.create_task(self.receive_messages())
 
-    def _is_ws_open(self) -> bool:
-        """Compatibility check for websockets versions to determine if connection is open."""
-        if not self.ws:
-            return False
-        # Prefer 'closed' if available (newer versions)
-        if hasattr(self.ws, "closed"):
-            try:
-                return not bool(self.ws.closed)
-            except Exception:
-                pass
-        # Fallback to 'open' (older versions)
-        if hasattr(self.ws, "open"):
-            try:
-                return bool(self.ws.open)
-            except Exception:
-                pass
-        # If neither attribute is reliable, assume open if object exists
-        return True
     
     async def send_instructions_audio(self):
         """Send the instructions.wav file as audio input to be appended to current buffer"""
@@ -137,10 +115,8 @@ class OpenAIRealtimeAudioTextClient:
         except Exception as e:
             logger.error(f"Error in receive_messages: {e}", exc_info=True)
     
-    def register_handler(self, message_type: str, handler: Callable[[dict], asyncio.Future]):
-        self.handlers[message_type] = handler
-    
     async def default_handler(self, data: dict):
+        """Override default handler for OpenAI-specific logging"""
         message_type = data.get("type", "unknown")
         logger.warning(f"Unhandled message type received from OpenAI: {message_type}")
     

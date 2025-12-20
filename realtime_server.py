@@ -9,6 +9,8 @@ import uvicorn
 import logging
 from prompts import PROMPTS
 from openai_realtime_client import OpenAIRealtimeAudioTextClient
+from xai_realtime_client import XAIRealtimeAudioTextClient
+from realtime_client_base import RealtimeClientBase
 from starlette.websockets import WebSocketState
 import wave
 import datetime
@@ -25,6 +27,9 @@ from config import (
     OPENAI_REALTIME_MODEL,
     OPENAI_REALTIME_MODALITIES,
     OPENAI_REALTIME_SESSION_TTL_SEC,
+    XAI_API_KEY,
+    XAI_REALTIME_VOICE,
+    REALTIME_PROVIDER,
 )
 
 # Gemini transcription import is deferred to runtime inside the endpoint
@@ -234,17 +239,47 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.warning("Buffered text discarded after removing marker prefix.")
         await emit_text_delta(buffered_text)
     
-    async def initialize_openai(model: str = None):
+    async def create_realtime_client(provider: str = None, model: str = None, voice: str = None) -> RealtimeClientBase:
+        """
+        Factory function to create appropriate realtime client.
+        
+        Args:
+            provider: Provider name ("openai" or "xai"). Defaults to REALTIME_PROVIDER config.
+            model: Model name (for OpenAI). Defaults to OPENAI_REALTIME_MODEL.
+            voice: Voice name (for x.ai). Defaults to XAI_REALTIME_VOICE.
+        
+        Returns:
+            RealtimeClientBase instance
+        """
+        provider = provider or REALTIME_PROVIDER
+        
+        if provider == "xai":
+            api_key = XAI_API_KEY
+            if not api_key:
+                raise ValueError("XAI_API_KEY not set in environment variables")
+            selected_voice = voice or XAI_REALTIME_VOICE
+            logger.info(f"Creating x.ai client with voice: {selected_voice}")
+            return XAIRealtimeAudioTextClient(api_key, voice=selected_voice)
+        else:  # default to openai
+            api_key = OPENAI_API_KEY
+            if not api_key:
+                raise ValueError("OPENAI_API_KEY not set in environment variables")
+            selected_model = model or OPENAI_REALTIME_MODEL
+            logger.info(f"Creating OpenAI client with model: {selected_model}")
+            return OpenAIRealtimeAudioTextClient(api_key, model=selected_model)
+    
+    async def initialize_realtime_client(provider: str = None, model: str = None, voice: str = None):
         nonlocal client
         try:
             # Clear the ready flag while initializing
             openai_ready.clear()
             
-            # Use provided model or fall back to default
-            selected_model = model if model else OPENAI_REALTIME_MODEL
-            client = OpenAIRealtimeAudioTextClient(os.getenv("OPENAI_API_KEY"), model=selected_model)
+            # Create client using factory function
+            client = await create_realtime_client(provider=provider, model=model, voice=voice)
             await client.connect()
-            logger.info("Successfully connected to OpenAI client")
+            
+            provider_name = provider or REALTIME_PROVIDER
+            logger.info(f"Successfully connected to {provider_name} client")
             
             # Register handlers after client is initialized
             client.register_handler("session.updated", lambda data: handle_generic_event("session.updated", data))
@@ -277,7 +312,7 @@ async def websocket_endpoint(websocket: WebSocket):
             }, ensure_ascii=False))
             return False
 
-    # Move the handler definitions here (before initialize_openai)
+    # Move the handler definitions here (before initialize_realtime_client)
     async def handle_text_delta(data):
         nonlocal response_buffer, marker_seen, delta_counter
         try:
@@ -402,14 +437,24 @@ async def websocket_endpoint(websocket: WebSocket):
                         msg = json.loads(data["text"])
                         
                         if msg.get("type") == "start_recording":
-                            # Update status to connecting while initializing OpenAI
+                            # Update status to connecting while initializing realtime client
                             await websocket.send_text(json.dumps({
                                 "type": "status",
                                 "status": "connecting"
                             }, ensure_ascii=False))
-                            # Extract model from message, if provided
-                            model = msg.get("model")
-                            if not await initialize_openai(model=model):
+                            # Extract provider, model, and voice from message
+                            provider = msg.get("provider")  # "openai" or "xai"
+                            model = msg.get("model")  # OpenAI model name
+                            voice = msg.get("voice")  # x.ai voice name
+                            
+                            # Determine provider based on model if not explicitly provided
+                            if not provider:
+                                if model and model.startswith("grok-") or model == "xai":
+                                    provider = "xai"
+                                else:
+                                    provider = "openai"
+                            
+                            if not await initialize_realtime_client(provider=provider, model=model, voice=voice):
                                 continue
                             recording_stopped.clear()
                             pending_audio_chunks.clear()
@@ -507,193 +552,6 @@ async def websocket_endpoint(websocket: WebSocket):
             except RuntimeError as e:
                 logger.warning(f"Ignoring error during websocket close: {e}")
         logger.info("WebSocket connection closed for /api/v1/ws")
-
-@app.websocket("/api/v1/ws/transcribe")
-async def websocket_transcribe_endpoint(websocket: WebSocket):
-    logger.info("New Transcription WebSocket connection attempt")
-    await websocket.accept()
-    logger.info("Transcription WebSocket connection accepted")
-
-    await websocket.send_text(json.dumps({
-        "type": "status",
-        "status": "idle"
-    }))
-
-    openai_client: OpenAIRealtimeAudioTextClient | None = None
-    audio_processor = AudioProcessor() # Assuming AudioProcessor is suitable or OpenAI handles 24kHz PCM16
-    chunk_count = 0  # Counter for audio chunks
-    
-    # Audio buffering for 5-second intervals
-    audio_buffer = []
-    last_send_time = time.time()
-    send_interval = 5.0  # Send every 5 seconds
-    
-    # Handlers for OpenAI transcription messages
-    async def handle_partial_transcript(data: dict):
-        transcript_text = data.get("text", "") # Assuming 'text' field based on typical OpenAI responses
-        if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.send_text(json.dumps({
-                "type": "transcription_update",
-                "is_partial": True,
-                "text": transcript_text
-            }))
-            logger.debug(f"Sent partial transcript: {transcript_text}")
-
-    async def handle_final_transcript(data: dict):
-        transcript_text = data.get("text", "") # Assuming 'text' field
-        if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.send_text(json.dumps({
-                "type": "transcription_update",
-                "is_partial": False,
-                "text": transcript_text
-            }))
-            logger.info(f"Sent final transcript: {transcript_text}")
-    
-    async def handle_transcription_error(data: dict):
-        error_msg = data.get("error", {}).get("message", "Unknown transcription error")
-        logger.error(f"OpenAI transcription error: {error_msg}")
-        if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "content": error_msg
-            }))
-
-    async def handle_transcription_delta(data: dict):
-        # Handle partial transcription from conversation.item.input_audio_transcription.delta
-        transcript_text = data.get("delta", "") # Check for 'delta' field
-        if not transcript_text:
-            transcript_text = data.get("text", "") # Fallback to 'text' field
-        if websocket.client_state == WebSocketState.CONNECTED and transcript_text:
-            await websocket.send_text(json.dumps({
-                "type": "transcription_update",
-                "is_partial": True,
-                "text": transcript_text
-            }))
-            logger.debug(f"Sent partial transcript delta: {transcript_text}")
-
-    async def handle_transcription_completed(data: dict):
-        # Handle completed transcription from conversation.item.input_audio_transcription.completed
-        transcript_text = data.get("transcript", "") # Check for 'transcript' field
-        if not transcript_text:
-            transcript_text = data.get("text", "") # Fallback to 'text' field
-        if websocket.client_state == WebSocketState.CONNECTED and transcript_text:
-            await websocket.send_text(json.dumps({
-                "type": "transcription_update",
-                "is_partial": False,
-                "text": transcript_text
-            }))
-            logger.info(f"Sent completed transcript: {transcript_text}")
-
-    async def handle_generic_transcription_event(event_type: str, data: dict):
-        logger.info(f"Handled transcription event {event_type} with data: {json.dumps(data, ensure_ascii=False)}")
-
-    async def send_buffered_audio():
-        """Send accumulated audio buffer to OpenAI"""
-        nonlocal audio_buffer, last_send_time
-        
-        if audio_buffer and openai_client:
-            # Combine all buffered audio chunks
-            combined_audio = b''.join(audio_buffer)
-            await openai_client.send_audio(combined_audio)
-            await openai_client.commit_audio()
-            logger.info(f"Sent and committed {len(audio_buffer)} audio chunks ({len(combined_audio)} bytes) for transcription")
-            
-            # Clear buffer and update timestamp
-            audio_buffer = []
-            last_send_time = time.time()
-
-    try:
-        openai_client = OpenAIRealtimeAudioTextClient(api_key=OPENAI_API_KEY)
-        
-        # Connect in transcription mode
-        await websocket.send_text(json.dumps({"type": "status", "status": "connecting_openai"}))
-        await openai_client.connect(session_mode="transcription")
-        logger.info("Successfully connected to OpenAI client for transcription")
-
-        # Register handlers
-        # IMPORTANT: Adjust message types if these are not what OpenAI uses for realtime transcription
-        openai_client.register_handler("transcript.partial", handle_partial_transcript) # Placeholder
-        openai_client.register_handler("transcript.final", handle_final_transcript)     # Placeholder
-        openai_client.register_handler("text.delta", handle_partial_transcript) # More likely for streaming text
-        openai_client.register_handler("text.final", handle_final_transcript) # More likely for final text
-        openai_client.register_handler("error", handle_transcription_error)
-        
-        # Add handlers for the actual transcription message types we see in logs
-        openai_client.register_handler("conversation.item.input_audio_transcription.delta", handle_transcription_delta)
-        openai_client.register_handler("conversation.item.input_audio_transcription.completed", handle_transcription_completed)
-        openai_client.register_handler("session.updated", lambda data: handle_generic_transcription_event("session.updated", data))
-        openai_client.register_handler("input_audio_buffer.speech_started", lambda data: handle_generic_transcription_event("input_audio_buffer.speech_started", data))
-        openai_client.register_handler("input_audio_buffer.committed", lambda data: handle_generic_transcription_event("input_audio_buffer.committed", data))
-        openai_client.register_handler("conversation.item.created", lambda data: handle_generic_transcription_event("conversation.item.created", data))
-
-        await websocket.send_text(json.dumps({"type": "status", "status": "connected_openai_transcribing"}))
-
-        # Main loop to receive audio from client and send to OpenAI
-        while True:
-            if websocket.client_state == WebSocketState.DISCONNECTED:
-                logger.info("Transcription WebSocket client disconnected by client.")
-                break
-            
-            try:
-                # Use a short timeout to check if we need to send buffered audio
-                data = await asyncio.wait_for(websocket.receive(), timeout=1.0)
-                
-                if "bytes" in data:
-                    audio_chunk = data["bytes"]
-                    processed_audio = audio_processor.process_audio_chunk(audio_chunk)
-                    audio_buffer.append(processed_audio)
-                    chunk_count += 1
-                    
-                    # Check if 5 seconds have passed since last send
-                    current_time = time.time()
-                    if current_time - last_send_time >= send_interval:
-                        await send_buffered_audio()
-                    
-                    logger.debug(f"Buffered audio chunk {chunk_count}, buffer size: {len(audio_buffer)} chunks")
-                    
-                elif "text" in data:
-                    message = json.loads(data["text"])
-                    if message.get("type") == "stop_transcription":
-                        # Send any remaining buffered audio before stopping
-                        if audio_buffer:
-                            await send_buffered_audio()
-                        logger.info("Received stop_transcription message from client.")
-                        break
-                    # Handle other text messages if needed
-                    logger.info(f"Received text message on transcribe endpoint: {message}")
-                    
-            except asyncio.TimeoutError:
-                # Check if we need to send buffered audio even without new data
-                current_time = time.time()
-                if audio_buffer and current_time - last_send_time >= send_interval:
-                    await send_buffered_audio()
-                continue
-
-    except websockets.exceptions.ConnectionClosedOK:
-        logger.info("Transcription WebSocket connection closed normally by client.")
-    except websockets.exceptions.ConnectionClosedError as e:
-        logger.warning(f"Transcription WebSocket connection closed with error: {e}")
-    except Exception as e:
-        logger.error(f"Error in transcription WebSocket endpoint: {e}", exc_info=True)
-        if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.send_text(json.dumps({"type": "error", "content": str(e)}))
-    finally:
-        # Send any remaining buffered audio before closing
-        if audio_buffer and openai_client:
-            try:
-                await send_buffered_audio()
-            except Exception as e:
-                logger.error(f"Error sending final buffered audio: {e}")
-        
-        if openai_client:
-            logger.info("Closing OpenAI client for transcription.")
-            await openai_client.close()
-        if websocket.client_state != WebSocketState.DISCONNECTED:
-            try:
-                await websocket.close()
-            except RuntimeError as e: # Handle case where connection might already be closing
-                logger.warning(f"Ignoring error during transcription websocket close: {e}")
-        logger.info("Transcription WebSocket connection logic finished.")
 
 @app.post(
     "/api/v1/readability",
