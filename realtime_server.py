@@ -421,88 +421,87 @@ async def websocket_endpoint(websocket: WebSocket):
                 except asyncio.CancelledError:
                     logger.info("Receive messages task cancelled")
                     raise
-                    
-                    if "bytes" in data:
-                        processed_audio = audio_processor.process_audio_chunk(data["bytes"])
-                        if not openai_ready.is_set():
-                            logger.debug("OpenAI not ready, buffering audio chunk")
-                            pending_audio_chunks.append(processed_audio)
-                        elif client and is_recording:
-                            await client.send_audio(processed_audio)
-                            await websocket.send_text(json.dumps({
-                                "type": "status",
-                                "status": "connected"
-                            }, ensure_ascii=False))
-                            logger.debug(f"Sent audio chunk, size: {len(processed_audio)} bytes")
-                        else:
-                            logger.warning("Received audio but client is not initialized")
-                            
-                    elif "text" in data:
-                        msg = json.loads(data["text"])
-                        
-                        if msg.get("type") == "start_recording":
-                            # Update status to connecting while initializing realtime client
-                            await websocket.send_text(json.dumps({
-                                "type": "status",
-                                "status": "connecting"
-                            }, ensure_ascii=False))
-                            # Extract provider, model, and voice from message
-                            provider = msg.get("provider")  # "openai" or "xai"
-                            model = msg.get("model")  # OpenAI model name
-                            voice = msg.get("voice")  # x.ai voice name
-                            
-                            # Determine provider based on model if not explicitly provided
-                            if not provider:
-                                if model and (model.startswith("grok-") or model == "xai" or model == "xai-grok"):
-                                    provider = "xai"
-                                else:
-                                    provider = "openai"
-                            
-                            if not await initialize_realtime_client(provider=provider, model=model, voice=voice):
-                                continue
-                            recording_stopped.clear()
-                            pending_audio_chunks.clear()
-                            # Immediately clear transcript for a new client-initiated request
-                            await websocket.send_text(json.dumps({
-                                "type": "text",
-                                "content": "",
-                                "isNewResponse": True
-                            }, ensure_ascii=False))
-                            clear_on_next_response = False
-                            is_recording = True
-                            
-                            # Send any buffered chunks
-                            if pending_audio_chunks and client:
-                                logger.info(f"Sending {len(pending_audio_chunks)} buffered chunks")
-                                for chunk in pending_audio_chunks:
-                                    await client.send_audio(chunk)
-                                pending_audio_chunks.clear()
-                            
-                        elif msg.get("type") == "stop_recording":
-                            # On explicit Stop, force-commit and force-create a response, then wait for completion.
-                            if client:
-                                # Immediately stop accepting further audio for this turn
-                                is_recording = False
-                                try:
-                                    await client.commit_audio()
-                                    await client.start_response(PROMPTS['paraphrase-gpt-realtime-enhanced'])
-                                except Exception as e:
-                                    logger.error(f"Error committing/starting response on stop: {str(e)}", exc_info=True)
-                                    # If we fail to kick off a response, surface that we're no longer recording
-                                    await websocket.send_text(json.dumps({
-                                        "type": "status",
-                                        "status": "idle"
-                                    }, ensure_ascii=False))
-                                    continue
-                                # Wait until the response is finished
-                                await recording_stopped.wait()
-
                 except asyncio.TimeoutError:
                     logger.debug("No message received for 30 seconds")
                     continue
                 except Exception as e:
-                    logger.error(f"Error in receive_messages loop: {str(e)}", exc_info=True)
+                    logger.error(f"Error receiving message: {str(e)}", exc_info=True)
                     break
+                
+                if "bytes" in data:
+                    processed_audio = audio_processor.process_audio_chunk(data["bytes"])
+                    if not openai_ready.is_set():
+                        logger.debug("OpenAI not ready, buffering audio chunk")
+                        pending_audio_chunks.append(processed_audio)
+                    elif client and is_recording:
+                        await client.send_audio(processed_audio)
+                        await websocket.send_text(json.dumps({
+                            "type": "status",
+                            "status": "connected"
+                        }, ensure_ascii=False))
+                        logger.debug(f"Sent audio chunk, size: {len(processed_audio)} bytes")
+                    else:
+                        logger.warning("Received audio but client is not initialized")
+                            
+                elif "text" in data:
+                    msg = json.loads(data["text"])
+                    
+                    if msg.get("type") == "start_recording":
+                        # Update status to connecting while initializing realtime client
+                        await websocket.send_text(json.dumps({
+                            "type": "status",
+                            "status": "connecting"
+                        }, ensure_ascii=False))
+                        # Extract provider, model, and voice from message
+                        provider = msg.get("provider")  # "openai" or "xai"
+                        model = msg.get("model")  # OpenAI model name
+                        voice = msg.get("voice")  # x.ai voice name
+                        
+                        # Determine provider based on model if not explicitly provided
+                        if not provider:
+                            if model and (model.startswith("grok-") or model == "xai" or model == "xai-grok"):
+                                provider = "xai"
+                            else:
+                                provider = "openai"
+                        
+                        if not await initialize_realtime_client(provider=provider, model=model, voice=voice):
+                            continue
+                        recording_stopped.clear()
+                        pending_audio_chunks.clear()
+                        # Immediately clear transcript for a new client-initiated request
+                        await websocket.send_text(json.dumps({
+                            "type": "text",
+                            "content": "",
+                            "isNewResponse": True
+                        }, ensure_ascii=False))
+                        clear_on_next_response = False
+                        is_recording = True
+                        
+                        # Send any buffered chunks
+                        if pending_audio_chunks and client:
+                            logger.info(f"Sending {len(pending_audio_chunks)} buffered chunks")
+                            for chunk in pending_audio_chunks:
+                                await client.send_audio(chunk)
+                            pending_audio_chunks.clear()
+                        
+                    elif msg.get("type") == "stop_recording":
+                        # On explicit Stop, force-commit and force-create a response, then wait for completion.
+                        if client:
+                            # Immediately stop accepting further audio for this turn
+                            is_recording = False
+                            try:
+                                await client.commit_audio()
+                                await client.start_response(PROMPTS['paraphrase-gpt-realtime-enhanced'])
+                            except Exception as e:
+                                logger.error(f"Error committing/starting response on stop: {str(e)}", exc_info=True)
+                                # If we fail to kick off a response, surface that we're no longer recording
+                                await websocket.send_text(json.dumps({
+                                    "type": "status",
+                                    "status": "idle"
+                                }, ensure_ascii=False))
+                                continue
+                            # Wait until the response is finished
+                            await recording_stopped.wait()
                 
         finally:
             # Cleanup when the loop exits
