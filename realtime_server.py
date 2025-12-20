@@ -304,7 +304,8 @@ async def websocket_endpoint(websocket: WebSocket):
             }, ensure_ascii=False))
             return True
         except Exception as e:
-            logger.error(f"Failed to connect to OpenAI: {e}")
+            provider_name = provider or REALTIME_PROVIDER
+            logger.error(f"Failed to connect to {provider_name} client: {e}")
             openai_ready.clear()  # Ensure flag is cleared on failure
             await websocket.send_text(json.dumps({
                 "type": "error",
@@ -449,7 +450,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             
                             # Determine provider based on model if not explicitly provided
                             if not provider:
-                                if model and model.startswith("grok-") or model == "xai":
+                                if model and (model.startswith("grok-") or model == "xai" or model == "xai-grok"):
                                     provider = "xai"
                                 else:
                                     provider = "openai"
