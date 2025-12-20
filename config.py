@@ -1,7 +1,7 @@
 import os
 
 # Global configuration for OpenAI realtime model
-OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-mini-2025-12-15")
 
 
 # Modalities for WebRTC sessions (text-only output by default)

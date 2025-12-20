@@ -11,3 +11,4 @@ pytest-asyncio
 pytest-mock
 httpx
 pydub
+python-dotenv
