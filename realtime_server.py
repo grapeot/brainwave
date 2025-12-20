@@ -528,12 +528,18 @@ async def websocket_endpoint(websocket: WebSocket):
                         model = msg.get("model")  # OpenAI model name
                         # voice parameter is deprecated for x.ai (not needed for text-only output)
                         
+                        logger.info(f"Received start_recording: provider={provider}, model={model}")
+                        
                         # Determine provider based on model if not explicitly provided
                         if not provider:
                             if model and (model.startswith("grok-") or model == "xai" or model == "xai-grok"):
                                 provider = "xai"
+                                logger.info(f"Auto-detected provider as 'xai' based on model: {model}")
                             else:
                                 provider = "openai"
+                                logger.info(f"Auto-detected provider as 'openai' based on model: {model}")
+                        else:
+                            logger.info(f"Using explicit provider: {provider}")
                         
                         if not await initialize_realtime_client(provider=provider, model=model):
                             continue

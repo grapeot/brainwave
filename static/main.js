@@ -597,15 +597,13 @@ async function startRecording() {
         const modelSelect = document.getElementById('modelSelect');
         const selectedModel = modelSelect ? modelSelect.value : 'gpt-realtime-mini-2025-12-15';
         
-        // Determine provider and model/voice based on selection
+        // Determine provider and model based on selection
         let provider = 'openai';
         let model = selectedModel;
-        let voice = null;
         
         if (selectedModel === 'xai-grok') {
             provider = 'xai';
             model = null;  // x.ai doesn't use model parameter
-            voice = 'Ara';  // Default voice for x.ai
         }
         
         // Create session in IndexedDB
@@ -613,12 +611,13 @@ async function startRecording() {
             await createSession();
         }
         
-        await ws.send(JSON.stringify({ 
+        const startMessage = { 
             type: 'start_recording', 
             provider: provider,
-            model: model,
-            voice: voice
-        }));
+            model: model
+        };
+        console.log('Sending start_recording:', startMessage);
+        await ws.send(JSON.stringify(startMessage));
         
         startTimer();
         recordButton.textContent = 'Stop';
@@ -736,23 +735,22 @@ async function replayLastRecording() {
         const modelSelect = document.getElementById('modelSelect');
         const selectedModel = modelSelect ? modelSelect.value : 'gpt-realtime-mini-2025-12-15';
         
-        // Determine provider and model/voice based on selection
+        // Determine provider and model based on selection
         let provider = 'openai';
         let model = selectedModel;
-        let voice = null;
         
         if (selectedModel === 'xai-grok') {
             provider = 'xai';
             model = null;
-            voice = 'Ara';
         }
         
-        await ws.send(JSON.stringify({ 
+        const startMessage = { 
             type: 'start_recording', 
             provider: provider,
-            model: model,
-            voice: voice
-        }));
+            model: model
+        };
+        console.log('Sending start_recording:', startMessage);
+        await ws.send(JSON.stringify(startMessage));
         
         // Wait a bit for backend to initialize
         await new Promise(resolve => setTimeout(resolve, 200));
