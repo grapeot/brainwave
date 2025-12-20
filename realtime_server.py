@@ -295,7 +295,18 @@ async def websocket_endpoint(websocket: WebSocket):
             client.register_handler("response.done", lambda data: handle_response_done(data))
             client.register_handler("error", lambda data: handle_error(data))
             client.register_handler("response.text.delta", lambda data: handle_text_delta(data))
+            # x.ai uses response.output_audio_transcript.delta instead of response.text.delta
+            client.register_handler("response.output_audio_transcript.delta", lambda data: handle_text_delta(data))
             client.register_handler("response.created", lambda data: handle_response_created(data))
+            # x.ai specific message types
+            client.register_handler("input_audio_buffer.speech_stopped", lambda data: handle_generic_event("input_audio_buffer.speech_stopped", data))
+            client.register_handler("input_audio_buffer.committed", lambda data: handle_generic_event("input_audio_buffer.committed", data))
+            client.register_handler("conversation.item.added", lambda data: handle_generic_event("conversation.item.added", data))
+            client.register_handler("conversation.item.input_audio_transcription.completed", lambda data: handle_generic_event("conversation.item.input_audio_transcription.completed", data))
+            client.register_handler("response.output_audio_transcript.done", lambda data: handle_generic_event("response.output_audio_transcript.done", data))
+            client.register_handler("response.output_audio.delta", lambda data: handle_generic_event("response.output_audio.delta", data))
+            client.register_handler("response.output_audio.done", lambda data: handle_generic_event("response.output_audio.done", data))
+            client.register_handler("ping", lambda data: handle_generic_event("ping", data))
             
             openai_ready.set()  # Set ready flag after successful initialization
             await websocket.send_text(json.dumps({
