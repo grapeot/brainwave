@@ -185,9 +185,20 @@ function createAudioProcessor() {
         
         const inputData = e.inputBuffer.getChannelData(0);
         const pcmData = new Int16Array(inputData.length);
-        
+
+        // Check audio levels and log periodically (for debugging)
+        let maxFloat = 0;
+        let maxPCM = 0;
         for (let i = 0; i < inputData.length; i++) {
-            pcmData[i] = Math.max(-32768, Math.min(32767, Math.floor(inputData[i] * 32767)));
+            maxFloat = Math.max(maxFloat, Math.abs(inputData[i]));
+            const pcmValue = Math.max(-32768, Math.min(32767, Math.floor(inputData[i] * 32767)));
+            pcmData[i] = pcmValue;
+            maxPCM = Math.max(maxPCM, Math.abs(pcmValue));
+        }
+
+        // Log audio levels every ~2 seconds (at 48kHz with 4096 buffer = ~12 chunks/sec)
+        if (Math.random() < 0.08) {
+            console.log(`🎤 Audio levels - Float: ${maxFloat.toFixed(3)} (0.0-1.0), PCM16: ${maxPCM} (expected >1000 for speech)`);
         }
         
         const combinedBuffer = new Int16Array(audioBuffer.length + pcmData.length);
@@ -569,13 +580,13 @@ async function startRecording() {
             cleanupAudioResources();
             
             try {
-                stream = await navigator.mediaDevices.getUserMedia({ 
+                stream = await navigator.mediaDevices.getUserMedia({
                     audio: {
                         channelCount: 1,
                         echoCancellation: true,
                         noiseSuppression: true,
-                        autoGainControl: true
-                    } 
+                        autoGainControl: false  // Disable browser AGC - use system mic settings
+                    }
                 });
                 streamInitialized = true;
             } catch (err) {

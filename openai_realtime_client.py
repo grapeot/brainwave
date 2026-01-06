@@ -122,9 +122,11 @@ class OpenAIRealtimeAudioTextClient(RealtimeClientBase):
     
     async def send_audio(self, audio_data: bytes):
         if self._is_ws_open():
+            encoded = base64.b64encode(audio_data).decode('utf-8')
+            logger.debug(f"🎤 Encoding {len(audio_data)} bytes → {len(encoded)} base64 chars for OpenAI")
             await self.ws.send(json.dumps({
                 "type": "input_audio_buffer.append",
-                "audio": base64.b64encode(audio_data).decode('utf-8')
+                "audio": encoded
             }))
         else:
             logger.error("WebSocket is not open. Cannot send audio.")

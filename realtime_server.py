@@ -179,20 +179,37 @@ class AudioProcessor:
     def process_audio_chunk(self, audio_data):
         # Convert binary audio data to Int16 array
         pcm_data = np.frombuffer(audio_data, dtype=np.int16)
-        
+
+        # Check audio quality
+        max_amplitude = np.max(np.abs(pcm_data))
+        rms = np.sqrt(np.mean(pcm_data.astype(np.float32) ** 2))
+
+        # Determine audio quality status
+        if max_amplitude == 0:
+            quality_status = "silent"
+            logger.warning("⚠️ Silent audio detected! All samples are zero.")
+        elif max_amplitude < 100:
+            quality_status = "too_quiet"
+            logger.warning(f"⚠️ Very quiet audio detected! Max amplitude: {max_amplitude} (expected > 1000)")
+        else:
+            quality_status = "ok"
+            logger.debug(f"Audio quality: max_amp={max_amplitude}, rms={rms:.1f}")
+
         # Convert to float32 for better precision during resampling
         float_data = pcm_data.astype(np.float32) / 32768.0
-        
+
         # Resample from 48kHz to 24kHz
         resampled_data = scipy.signal.resample_poly(
-            float_data, 
-            self.target_sample_rate, 
+            float_data,
+            self.target_sample_rate,
             self.source_sample_rate
         )
-        
+
         # Convert back to int16 while preserving amplitude
         resampled_int16 = (resampled_data * 32768.0).clip(-32768, 32767).astype(np.int16)
-        return resampled_int16.tobytes()
+
+        # Return both audio and quality info
+        return resampled_int16.tobytes(), quality_status, max_amplitude
 
     def save_audio_buffer(self, audio_buffer, filename):
         with wave.open(filename, 'wb') as wf:
@@ -328,6 +345,7 @@ async def websocket_endpoint(websocket: WebSocket):
             client.register_handler("input_audio_buffer.committed", lambda data: handle_generic_event("input_audio_buffer.committed", data))
             client.register_handler("conversation.item.added", lambda data: handle_generic_event("conversation.item.added", data))
             client.register_handler("conversation.item.input_audio_transcription.completed", lambda data: handle_generic_event("conversation.item.input_audio_transcription.completed", data))
+            client.register_handler("conversation.item.input_audio_transcription.failed", lambda data: handle_transcription_failed(data))
             client.register_handler("response.output_audio_transcript.done", lambda data: handle_generic_event("response.output_audio_transcript.done", data))
             client.register_handler("response.output_audio.delta", lambda data: handle_generic_event("response.output_audio.delta", data))
             client.register_handler("response.output_audio.done", lambda data: handle_generic_event("response.output_audio.done", data))
@@ -464,6 +482,22 @@ async def websocket_endpoint(websocket: WebSocket):
             except Exception as e:
                 logger.error(f"Error closing OpenAI client: {str(e)}", exc_info=True)
 
+    async def handle_transcription_failed(data):
+        """Handle transcription failure events from OpenAI"""
+        logger.error(f"⚠️ TRANSCRIPTION FAILED: {json.dumps(data, indent=2)}")
+
+        # Extract error details
+        error_msg = data.get("error", {})
+        item_id = data.get("item_id", "unknown")
+
+        # Send error to frontend
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "content": f"Transcription failed: {error_msg.get('message', 'Unknown error')}",
+                "details": error_msg
+            }, ensure_ascii=False))
+
     async def handle_generic_event(event_type, data):
         logger.info(f"Handled {event_type} with data: {json.dumps(data, ensure_ascii=False)}")
 
@@ -497,7 +531,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     break
                 
                 if "bytes" in data:
-                    processed_audio = audio_processor.process_audio_chunk(data["bytes"])
+                    logger.debug(f"📤 Received {len(data['bytes'])} bytes of audio from frontend")
+                    processed_audio, quality_status, max_amp = audio_processor.process_audio_chunk(data["bytes"])
+                    logger.debug(f"🔊 Processed audio: {len(processed_audio)} bytes (after 48kHz→24kHz resampling)")
+
                     if not openai_ready.is_set():
                         logger.debug("OpenAI not ready, buffering audio chunk")
                         pending_audio_chunks.append(processed_audio)
@@ -507,7 +544,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "type": "status",
                             "status": "connected"
                         }, ensure_ascii=False))
-                        logger.debug(f"Sent audio chunk, size: {len(processed_audio)} bytes")
+                        logger.debug(f"📡 Sent {len(processed_audio)} bytes to OpenAI")
                     else:
                         logger.warning("Received audio but client is not initialized")
                             
